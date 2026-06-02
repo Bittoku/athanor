@@ -89,15 +89,25 @@ The single most reused primitive; get the boundaries exact.
 
 ---
 
-## T0.4 — network params — `Athanor.P2P.Network`
-**RED** — `network_test.exs`:
-- `mainnet().magic == <<0xE3, 0xE1, 0xF3, 0xE8>>` (wire order), `default_port == 8333`.
-- `dns_seeds` includes the three known hosts; `fallback_seeds` is a non-empty list of `{ip, port}`.
-- `command_name(:version) == "version"`, padded form `padded_command(:verack) == <<"verack", 0,0,0,0,0,0>>`
-  (exactly 12 bytes); unknown atom raises.
+## T0.4 — network params — `Athanor.P2P.Network` (mainnet **and** testnet)
+Athanor defaults to **testnet** (`config/runtime.exs:29`, `lib/athanor/blockchain/network.ex:37-40`),
+so params are network-keyed from the start — no P2P code may hardcode mainnet.
 
-**GREEN:** module attributes + small maps.
-**REFACTOR:** derive padding via `String.pad_trailing/3` on the binary.
+**RED** — `network_test.exs`:
+- `mainnet().magic == <<0xE3, 0xE1, 0xF3, 0xE8>>` (wire order), `mainnet().default_port == 8333`.
+- `testnet().magic == <<0xF4, 0xE5, 0xF3, 0xF4>>` and `testnet().default_port == 18333`
+  — **values to confirm against `bitcoin-sv` `chainparams.cpp` (Testnet3) in this task**; the test
+  encodes the confirmed constants so any drift is caught.
+- `for_network(:mainnet) == mainnet()` and `for_network(:testnet) == testnet()`; an unknown atom raises.
+  (`for_network/1` is what the supervisor calls with Athanor's resolved network.)
+- each network's `dns_seeds` is a non-empty list (mainnet: the three known hosts; testnet:
+  `testnet-seed.bitcoinsv.io` et al — confirm); `fallback_seeds` is a non-empty list of `{ip, port}`
+  per network (mirror `pnSeed6_main` / `pnSeed6_test`).
+- `command_name(:version) == "version"`, padded form `padded_command(:verack) == <<"verack", 0,0,0,0,0,0>>`
+  (exactly 12 bytes); unknown atom raises. (Command encoding is network-independent.)
+
+**GREEN:** module attributes + small per-network maps + `for_network/1`.
+**REFACTOR:** derive padding via `String.pad_trailing/3` on the binary; share the command table across networks.
 
 ---
 
@@ -269,16 +279,20 @@ This is the "is our codec actually wire-correct" gate (DXS's canonical vector id
 #   printf '<our version frame hex>' | xxd -r -p | nc <peer_ip> 8333 | xxd -p | head
 # or use a known-good vector from bitcoin-sv functional test data.
 ```
-Put the captured hex blobs in `test/support/p2p_vectors.ex` as module functions
-(`real_version_frame/0`, `real_headers_body/0`, `real_block_header/0`).
+Put the captured hex blobs in `test/support/p2p_vectors.ex` as module functions, **per network**
+(`testnet_version_frame/0`, `mainnet_version_frame/0`, `testnet_block_header/0`,
+`mainnet_block_header/0`, …). Testnet is the default and the cheapest to capture (port 18333), so it
+is the required vector; mainnet is captured too so the magic/seed divergence is exercised.
 
-**RED** tests:
-- `decode(mainnet, real_version_frame())` → `{:ok, %Frame{command: "version"}, <<>>}` and
-  `Version.parse(frame.payload)` recovers a sane `start_height` (> 800_000 on mainnet), a `user_agent`
-  starting with `/`, protocol ≥ 70015.
-- `Headers.parse(real_headers_body())` yields the expected header count and the first header's
-  `hash/1` equals the known block hash (display-order) for that height.
-- `BlockHeader.hash(real_block_header())` equals a hardcoded known block id.
+**RED** tests (run for **both** networks):
+- `decode(testnet(), testnet_version_frame())` → `{:ok, %Frame{command: "version"}, <<>>}` and
+  `Version.parse(frame.payload)` recovers a sane `start_height` (> 1_600_000 on testnet3 / > 800_000 on
+  mainnet), a `user_agent` starting with `/`, protocol ≥ 70015. Same for the mainnet vector with
+  `mainnet()` — and a **cross-network negative**: `decode(mainnet(), testnet_version_frame())` →
+  `{:error, :bad_magic}` (proves magic is actually enforced per network).
+- `Headers.parse(<network>_headers_body())` yields the expected header count and the first header's
+  `hash/1` equals the known block hash (display-order) for that height on that network.
+- `BlockHeader.hash(<network>_block_header())` equals a hardcoded known block id.
 
 **GREEN:** by this point the codec should already pass these; if not, the real vector exposes the bug
 the synthetic KATs hid (usually hash order or a leniency gap). Fix minimally, re-run.
@@ -297,4 +311,3 @@ the synthetic KATs hid (usually hash order or a leniency gap). Fix minimally, re
 T0.6 decode → T0.7 version → T0.8 protoconf → T0.9 inv → T0.10 headers → T0.11 reject →
 T0.12 addr → T0.13 props → T0.14 conformance`.
 Each is a standalone failing-test-first commit; T0.6 and T0.14 are the two highest-risk and deserve the most cases.
-```

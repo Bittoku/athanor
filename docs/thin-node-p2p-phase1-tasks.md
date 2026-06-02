@@ -13,7 +13,8 @@ The handshake/IO logic is split into three testable layers so we never need to m
 2. **Injectable transport** (`P2P.Transport` behaviour) — `:gen_tcp` in prod, a controllable fake in
    tests. Lets us drive socket events synchronously from a test.
 3. **Real loopback integration** — a tiny in-test "fake peer" that genuinely speaks the wire protocol
-   over `127.0.0.1`, for one end-to-end confidence test. Plus a `@tag :external` live-mainnet smoke.
+   over `127.0.0.1`, for one end-to-end confidence test. Plus a `@tag :external` live smoke
+   (testnet by default — matches the repo's default network — with mainnet opt-in).
 
 ## TDD discipline (every task)
 RED (write test, run `mix test <file>`, confirm failure reason) → GREEN (minimal) → REFACTOR (+ doc
@@ -27,6 +28,21 @@ headers per project rule) → commit `feat(p2p): <task>` (no AI attribution). As
   `{:peer, pid, :frame, %Frame{}}`, `{:peer, pid, :down, reason}`. Tests assert on these with
   `assert_receive` (no sleeps — satisfies the project no-`Process.sleep` rule).
 - Wire timeouts injected tiny in tests (e.g. handshake 50 ms) so timeout paths are fast and deterministic.
+
+---
+
+## T1.S — Test setup: exclude `:external` tests by default (do FIRST) — *added per review*
+The plan assumes live-network tests are excluded by default, but the repo does not configure that yet:
+`test/test_helper.exs:1-6` only starts ExUnit + stubs.
+
+**RED:** add a test (or a CI assertion) that `mix test` does **not** run a sentinel `@tag :external` test,
+and that `mix test --only external` **does**.
+**GREEN:** edit `test/test_helper.exs` to add:
+```elixir
+ExUnit.configure(exclude: [external: true])
+```
+**REFACTOR/verify:** confirm both `mix test` (external skipped) and `mix test --only external`
+(external runs) behave as intended. Every `@tag :external` test below (T1.8) relies on this.
 
 ---
 
@@ -171,10 +187,13 @@ active-mode messages, and byte framing actually work together.
 
 ---
 
-## T1.8 — live mainnet smoke (manual / CI-skipped) — `@tag :external`
-**RED/GREEN:** `@tag :external` (excluded by default in `test_helper.exs`):
-- connect `Peer` to a real seed-resolved mainnet node; `assert_receive {:peer, _, :ready, v}, 10_000`
-  with `v.start_height > 800_000` and `v.user_agent =~ "/"`; expect at least one inbound `inv` within a few seconds.
+## T1.8 — live smoke (manual / CI-skipped) — `@tag :external`
+**RED/GREEN:** `@tag :external` (excluded by default per T1.S):
+- **Default network = testnet** (matches `config/runtime.exs:29`): connect `Peer` to a seed-resolved
+  **testnet** node; `assert_receive {:peer, _, :ready, v}, 10_000` with `v.start_height > 1_600_000`
+  (testnet3) and `v.user_agent =~ "/"`; expect at least one inbound `inv` within a few seconds.
+- **Mainnet variant is opt-in:** same test parameterized for `mainnet()` (`start_height > 800_000`),
+  selected via env (e.g. `P2P_SMOKE_NETWORK=mainnet`) so it doesn't run unless explicitly requested.
 - Documents the one true external dependency check; run with `mix test --only external`.
 
 **GREEN:** none — pure observation. If it fails where T1.7 passed, suspect magic/seed/UA-filtering, not framing.
@@ -196,11 +215,12 @@ active-mode messages, and byte framing actually work together.
 - Handshake logic provably correct in both frame orderings and all four failure modes
   (timeout, reject, bad version, connect-fail) via the pure reducer.
 - One real-socket loopback test proves end-to-end framing; one tagged live test proves wire-correctness
-  against mainnet.
+  against the live network (testnet by default; mainnet opt-in).
+- `test/test_helper.exs` excludes `:external` by default (T1.S); `mix test` and `mix test --only external`
+  both verified.
 - Peer is fully transport-injectable (no hard `:gen_tcp` dependency in the GenServer logic).
 
 ## Suggested commit sequence
-`T1.0 transport → T1.1 frame_buffer → T1.2 handshake_reducer → T1.3 peer_connect →
+`T1.S test-setup → T1.0 transport → T1.1 frame_buffer → T1.2 handshake_reducer → T1.3 peer_connect →
 T1.4 steady_loop → T1.5 keepalive → T1.6 teardown → T1.7 loopback_integration → T1.8 live_smoke`.
 Highest-risk: **T1.2** (handshake correctness — most cases) and **T1.7** (real-socket reality check).
-```
