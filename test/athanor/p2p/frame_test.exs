@@ -83,7 +83,9 @@ defmodule Athanor.P2P.FrameTest do
 
     test "{:error, :bad_command} when bytes after the first NUL are non-zero" do
       bad_command = <<"inv", 0, 0, 0, 0, 0, 0, 0, 0, 1>>
-      frame = <<0xE3, 0xE1, 0xF3, 0xE8>> <> bad_command <> <<0::little-32>> <> Hash.checksum4(<<>>)
+
+      frame =
+        <<0xE3, 0xE1, 0xF3, 0xE8>> <> bad_command <> <<0::little-32>> <> Hash.checksum4(<<>>)
 
       assert Frame.decode(Network.mainnet(), frame) == {:error, :bad_command}
     end

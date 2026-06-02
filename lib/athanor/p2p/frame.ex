@@ -82,7 +82,8 @@ defmodule Athanor.P2P.Frame do
     max_payload = Keyword.get(opts, :max_payload, @default_max_payload)
 
     case buffer do
-      <<^magic::binary-4, command::binary-12, length::little-32, checksum::binary-4, rest::binary>> ->
+      <<^magic::binary-4, command::binary-12, length::little-32, checksum::binary-4,
+        rest::binary>> ->
         decode_body(command, length, checksum, rest, max_payload)
 
       # Enough bytes to judge the magic, and it is wrong → fatal.

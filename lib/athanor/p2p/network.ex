@@ -110,7 +110,8 @@ defmodule Athanor.P2P.Network do
   Raises `FunctionClauseError` on an unknown command.
   """
   @spec command_name(atom()) :: String.t()
-  def command_name(command) when is_map_key(@commands, command), do: Map.fetch!(@commands, command)
+  def command_name(command) when is_map_key(@commands, command),
+    do: Map.fetch!(@commands, command)
 
   @doc """
   Returns the 12-byte NUL-padded wire command field for a known command atom.
