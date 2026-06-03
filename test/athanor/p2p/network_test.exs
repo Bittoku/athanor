@@ -14,15 +14,29 @@ defmodule Athanor.P2P.NetworkTest do
       assert Network.testnet().default_port == 18333
     end
 
-    test "each network advertises DNS seeds; fallback_seeds is a list" do
+    test "each network advertises non-empty DNS seeds (the Phase-0 bootstrap contract)" do
       for params <- [Network.mainnet(), Network.testnet()] do
         assert is_list(params.dns_seeds) and params.dns_seeds != []
         assert Enum.all?(params.dns_seeds, &is_binary/1)
-        assert is_list(params.fallback_seeds)
       end
 
       assert "seed.bitcoinsv.io" in Network.mainnet().dns_seeds
       assert "testnet-seed.bitcoinsv.io" in Network.testnet().dns_seeds
+    end
+
+    test "fallback_seeds is a well-typed {ip, port} list (empty in Phase 0; populated in Phase 2)" do
+      # Revised per MR !2 review: hardcoded IP seeds (pnSeed6_*) are deferred to Phase 2
+      # discovery. The contract here is type-shape, not non-emptiness — DNS seeds + addr
+      # gossip are the Phase-0/Phase-2 bootstrap. This guards against a malformed entry
+      # sneaking in once Phase 2 populates the list.
+      for params <- [Network.mainnet(), Network.testnet()] do
+        assert is_list(params.fallback_seeds)
+
+        assert Enum.all?(params.fallback_seeds, fn
+                 {ip, port} when is_tuple(ip) and is_integer(port) -> true
+                 _ -> false
+               end)
+      end
     end
   end
 
