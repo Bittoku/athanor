@@ -120,7 +120,10 @@ a sibling supervisor) is decided with tests in §10.1.
   | magic (wire bytes) | `e3 e1 f3 e8` | `f4 e5 f3 f4` *(verify)* |
   | default port | 8333 | 18333 *(verify)* |
   | DNS seeds | `seed.bitcoinsv.io`, `seed.satoshisvision.network`, `seed.bitcoinseed.directory` | `testnet-seed.bitcoinsv.io` et al *(verify)* |
-  | fallback IPs | mirror `pnSeed6_main` | mirror `pnSeed6_test` |
+  | fallback IPs (Phase 2) | mirror `pnSeed6_main` | mirror `pnSeed6_test` |
+
+  Note: hardcoded fallback IPs are populated in **Phase 2 (discovery)**, not Phase 0 — DNS seeds +
+  `addr` gossip are the self-refreshing bootstrap; the bitcoin-sv IP tables go stale (revised per MR !2 review).
 - **Handshake:** send `version` → read frames until {peer version recv ∧ peer verack recv ∧ our verack sent}; 30s timeout. BSV-specific: send `protoconf` right after our verack (advertise max recv payload; raise to 32 MiB for big mainnet txs).
 - **Hash order trap:** every hash in P2P frames is **wire order** (LE, raw double-SHA256 output). Athanor's stores/REST use **display order** (byte-reversed). Centralize a `wire_to_display/1` + `display_to_wire/1` and convert ONLY at the P2P boundary. (This bit DXS repeatedly — see their `TxHashOrder`.)
 

@@ -101,8 +101,14 @@ so params are network-keyed from the start — no P2P code may hardcode mainnet.
 - `for_network(:mainnet) == mainnet()` and `for_network(:testnet) == testnet()`; an unknown atom raises.
   (`for_network/1` is what the supervisor calls with Athanor's resolved network.)
 - each network's `dns_seeds` is a non-empty list (mainnet: the three known hosts; testnet:
-  `testnet-seed.bitcoinsv.io` et al — confirm); `fallback_seeds` is a non-empty list of `{ip, port}`
-  per network (mirror `pnSeed6_main` / `pnSeed6_test`).
+  `testnet-seed.bitcoinsv.io` et al — confirm). **DNS seeds are the Phase-0 bootstrap contract.**
+- `fallback_seeds` is a well-typed list of `{ip, port}` and **is intentionally empty in Phase 0**
+  — hardcoded IP seeds (`pnSeed6_main` / `pnSeed6_test`) are **deferred to Phase 2 (discovery)**,
+  where addr-gossip and a seed-freshness mechanism live. Rationale (revised per MR !2 review,
+  Hermes): those bitcoin-sv IP tables go stale (the project regenerates them precisely for that
+  reason), so DNS seeds + `addr` gossip are the real self-refreshing bootstrap; pinning stale IPs
+  in Phase 0 adds dead weight, not resilience. The test asserts `fallback_seeds` is a list and that
+  any present element is a `{ip, port}` tuple — it must NOT claim non-empty completion in Phase 0.
 - `command_name(:version) == "version"`, padded form `padded_command(:verack) == <<"verack", 0,0,0,0,0,0>>`
   (exactly 12 bytes); unknown atom raises. (Command encoding is network-independent.)
 
