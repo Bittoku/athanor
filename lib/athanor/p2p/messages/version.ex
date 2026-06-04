@@ -87,22 +87,23 @@ defmodule Athanor.P2P.Messages.Version do
         <<version::little-32, services::little-64, timestamp::signed-little-64,
           addr_recv::binary-26, addr_from::binary-26, nonce::little-64, rest::binary>>
       ) do
-    {user_agent, after_ua} = take_user_agent(rest)
-    {start_height, after_height} = take_start_height(after_ua)
-    {relay, tail} = take_relay(after_height)
+    with {:ok, user_agent, after_ua} <- take_user_agent(rest) do
+      {start_height, after_height} = take_start_height(after_ua)
+      {relay, tail} = take_relay(after_height)
 
-    {:ok,
-     %__MODULE__{
-       version: version,
-       services: services,
-       timestamp: timestamp,
-       addr_recv: addr_recv,
-       addr_from: addr_from,
-       nonce: nonce,
-       user_agent: user_agent,
-       start_height: start_height,
-       relay: relay
-     }, tail}
+      {:ok,
+       %__MODULE__{
+         version: version,
+         services: services,
+         timestamp: timestamp,
+         addr_recv: addr_recv,
+         addr_from: addr_from,
+         nonce: nonce,
+         user_agent: user_agent,
+         start_height: start_height,
+         relay: relay
+       }, tail}
+    end
   end
 
   def parse(buffer) when is_binary(buffer) and byte_size(buffer) < @fixed_prefix_size,
@@ -111,10 +112,16 @@ defmodule Athanor.P2P.Messages.Version do
   defp relay_byte(true), do: 1
   defp relay_byte(false), do: 0
 
+  # No post-prefix bytes at all -> the optional user_agent is empty. But a
+  # var_str prefix that is present yet incomplete must propagate :need_more,
+  # rather than be silently treated as "" with its bytes reinterpreted as the
+  # start_height field.
+  defp take_user_agent(<<>>), do: {:ok, "", <<>>}
+
   defp take_user_agent(rest) do
     case VarBytes.read_str(rest) do
-      {:ok, ua, tail} -> {ua, tail}
-      _ -> {"", rest}
+      {:ok, ua, tail} -> {:ok, ua, tail}
+      _ -> :need_more
     end
   end
 

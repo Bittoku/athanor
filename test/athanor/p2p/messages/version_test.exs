@@ -70,6 +70,13 @@ defmodule Athanor.P2P.Messages.VersionTest do
                Version.parse(prefix)
     end
 
+    test ":need_more when a user_agent var_str is present but incomplete (not silently empty)" do
+      # prefix + a var_str declaring 5 bytes but supplying only 3. Must NOT be
+      # accepted as user_agent: "" with those bytes reinterpreted as start_height.
+      prefix = binary_part(Version.serialize(fixture()), 0, 80)
+      assert Version.parse(prefix <> <<5, "abc">>) == :need_more
+    end
+
     test ":need_more when the fixed 80-byte prefix is incomplete" do
       # 40 zero bytes — a valid binary shorter than the 80-byte fixed prefix
       assert Version.parse(<<0::320>>) == :need_more
