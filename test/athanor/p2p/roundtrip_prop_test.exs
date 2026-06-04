@@ -38,7 +38,7 @@ defmodule Athanor.P2P.RoundtripPropTest do
   ]
 
   property "VarInt round-trips and always uses the minimal width" do
-    check all n <- integer(0..@u64) do
+    check all(n <- integer(0..@u64)) do
       encoded = VarInt.write(n)
       assert VarInt.read(encoded) == {:ok, n, <<>>}
 
@@ -55,7 +55,7 @@ defmodule Athanor.P2P.RoundtripPropTest do
   end
 
   property "VarBytes round-trips arbitrary payloads" do
-    check all payload <- binary() do
+    check all(payload <- binary()) do
       assert VarBytes.read_bytes(VarBytes.write_bytes(payload)) == {:ok, payload, <<>>}
     end
   end
@@ -63,8 +63,10 @@ defmodule Athanor.P2P.RoundtripPropTest do
   property "Frame encode∘decode is identity for any known command + payload" do
     net = Network.mainnet()
 
-    check all command <- member_of(@commands),
-              payload <- binary(max_length: 1024) do
+    check all(
+            command <- member_of(@commands),
+            payload <- binary(max_length: 1024)
+          ) do
       expected = {:ok, %Frame{command: Network.command_name(command), payload: payload}, <<>>}
       assert Frame.decode(net, Frame.encode(net, command, payload)) == expected
     end
@@ -73,7 +75,7 @@ defmodule Athanor.P2P.RoundtripPropTest do
   property "every proper prefix of a frame decodes to :need_more, never a false :ok" do
     net = Network.mainnet()
 
-    check all payload <- binary(max_length: 64) do
+    check all(payload <- binary(max_length: 64)) do
       frame = Frame.encode(net, :tx, payload)
 
       for split <- 0..(byte_size(frame) - 1) do
@@ -85,7 +87,7 @@ defmodule Athanor.P2P.RoundtripPropTest do
   property "inv serialize/parse round-trips, preserving order and wire hashes" do
     item = tuple({member_of([:tx, :block]), binary(length: 32)})
 
-    check all items <- list_of(item, max_length: 20) do
+    check all(items <- list_of(item, max_length: 20)) do
       assert Inv.parse(Inv.serialize(items)) == {:ok, items, <<>>}
     end
   end
@@ -94,13 +96,13 @@ defmodule Athanor.P2P.RoundtripPropTest do
     entry =
       tuple({integer(0..@u32), integer(0..@u64), binary(length: 16), integer(0..@u16)})
 
-    check all entries <- list_of(entry, max_length: 20) do
+    check all(entries <- list_of(entry, max_length: 20)) do
       assert Addr.parse(Addr.serialize(entries)) == {:ok, entries, <<>>}
     end
   end
 
   property "a headers body parses back to its BlockHeader list" do
-    check all raws <- list_of(binary(length: 80), max_length: 10) do
+    check all(raws <- list_of(binary(length: 80), max_length: 10)) do
       body =
         VarInt.write(length(raws)) <>
           Enum.map_join(raws, fn raw -> raw <> VarInt.write(0) end)
