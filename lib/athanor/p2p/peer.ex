@@ -87,7 +87,12 @@ defmodule Athanor.P2P.Peer do
   def handle_info({:tcp, socket, data}, %{socket: socket} = state) do
     case FrameBuffer.push(state.buffer, data) do
       {frames, buffer} ->
-        dispatch(frames, %{state | buffer: buffer})
+        # Re-arm `active: :once` after a successfully-processed chunk so a fast
+        # peer cannot flood the mailbox; on a fatal error we are exiting anyway.
+        case dispatch(frames, %{state | buffer: buffer}) do
+          {:noreply, state} -> {:noreply, rearm(state)}
+          {:stop, reason, state} -> {:stop, reason, state}
+        end
 
       {:error, reason, buffer} ->
         notify(state, {:down, reason})
@@ -126,9 +131,28 @@ defmodule Athanor.P2P.Peer do
     end
   end
 
-  # Steady-state frame handling is fleshed out in T1.4; until then, post-ready
-  # frames are simply not expected in the connect/handshake tests.
-  defp run_steady(_frames, state), do: {:noreply, state}
+  # Steady state: handle protocol housekeeping locally, forward everything else
+  # to the owner. Keepalive `ping`s are answered with `pong` without bothering
+  # the owner; the owner decides what to do with application frames.
+  defp run_steady([], state), do: {:noreply, state}
+
+  defp run_steady([frame | rest], state) do
+    {:ok, state} = handle_steady_frame(frame, state)
+    run_steady(rest, state)
+  end
+
+  defp handle_steady_frame(
+         %Frame{command: "ping", payload: <<nonce::little-64>>},
+         %{config: c, socket: socket} = state
+       ) do
+    c.transport.send(socket, Frame.encode(c.network, :pong, <<nonce::little-64>>))
+    {:ok, state}
+  end
+
+  defp handle_steady_frame(%Frame{} = frame, state) do
+    notify(state, {:frame, frame})
+    {:ok, state}
+  end
 
   ## Reducer action interpreter
 
@@ -167,8 +191,16 @@ defmodule Athanor.P2P.Peer do
   defp notify(%{config: %{owner: owner}}, {:ready, version}),
     do: send(owner, {:peer, self(), :ready, version})
 
+  defp notify(%{config: %{owner: owner}}, {:frame, frame}),
+    do: send(owner, {:peer, self(), :frame, frame})
+
   defp notify(%{config: %{owner: owner}}, {:down, reason}),
     do: send(owner, {:peer, self(), :down, reason})
+
+  defp rearm(%{config: c, socket: socket} = state) do
+    c.transport.setopts(socket, active: :once)
+    state
+  end
 
   defp connect_timeout(%Config{timeouts: t}), do: Map.get(t, :connect, @default_connect_timeout)
 
