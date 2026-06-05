@@ -39,6 +39,10 @@ defmodule Athanor.P2P.Peer do
   @spec start_link(Config.t()) :: GenServer.on_start()
   def start_link(%Config{} = config), do: GenServer.start_link(__MODULE__, config)
 
+  @doc "Gracefully stops `peer`; the owner is notified with `{:down, :stopped}`."
+  @spec stop(GenServer.server()) :: :ok
+  def stop(peer), do: GenServer.cast(peer, :stop)
+
   @impl true
   def init(%Config{} = config) do
     state = %{
@@ -106,6 +110,16 @@ defmodule Athanor.P2P.Peer do
     end
   end
 
+  def handle_info({:tcp_closed, socket}, %{socket: socket} = state) do
+    notify(state, {:down, :closed})
+    {:stop, :normal, state}
+  end
+
+  def handle_info({:tcp_error, socket, reason}, %{socket: socket} = state) do
+    notify(state, {:down, {:tcp_error, reason}})
+    {:stop, :normal, state}
+  end
+
   def handle_info(:handshake_timeout, %{phase: :handshaking} = state) do
     {handshake, actions} = Handshake.step(state.handshake, :timeout)
 
@@ -135,6 +149,21 @@ defmodule Athanor.P2P.Peer do
   end
 
   def handle_info({:inactivity, _stale}, state), do: {:noreply, state}
+
+  @impl true
+  def handle_cast(:stop, state) do
+    notify(state, {:down, :stopped})
+    {:stop, :normal, state}
+  end
+
+  @impl true
+  def terminate(_reason, %{socket: socket, config: c}) when not is_nil(socket) do
+    # Idempotent: closing an already-closed socket is a no-op.
+    c.transport.close(socket)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
 
   ## Frame dispatch
 
