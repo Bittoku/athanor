@@ -48,7 +48,11 @@ defmodule Athanor.P2P.Peer do
       handshake: nil,
       buffer: nil,
       hs_timer: nil,
-      peer_version: nil
+      peer_version: nil,
+      ping_nonce: nil,
+      ping_timer: nil,
+      inactivity_timer: nil,
+      inactivity_epoch: 0
     }
 
     {:ok, state, {:continue, :connect}}
@@ -90,7 +94,9 @@ defmodule Athanor.P2P.Peer do
         # Re-arm `active: :once` after a successfully-processed chunk so a fast
         # peer cannot flood the mailbox; on a fatal error we are exiting anyway.
         case dispatch(frames, %{state | buffer: buffer}) do
-          {:noreply, state} -> {:noreply, rearm(state)}
+          # Inbound traffic re-arms `active: :once` and resets the inactivity
+          # clock (a no-op when no inactivity timeout is configured).
+          {:noreply, state} -> {:noreply, state |> rearm() |> arm_inactivity()}
           {:stop, reason, state} -> {:stop, reason, state}
         end
 
@@ -111,6 +117,24 @@ defmodule Athanor.P2P.Peer do
 
   # A handshake timer that fires after the handshake already completed is moot.
   def handle_info(:handshake_timeout, state), do: {:noreply, state}
+
+  # Keepalive: send a fresh ping, remember its nonce, and re-arm the interval.
+  def handle_info(:send_ping, %{phase: :ready, config: c, socket: socket} = state) do
+    nonce = :rand.uniform(0x1_0000_0000_0000_0000) - 1
+    c.transport.send(socket, Frame.encode(c.network, :ping, <<nonce::little-64>>))
+    {:noreply, arm_ping(%{state | ping_nonce: nonce})}
+  end
+
+  def handle_info(:send_ping, state), do: {:noreply, state}
+
+  # Inactivity: the current-epoch timer disconnects; a stale one (superseded by
+  # an inbound reset) is ignored.
+  def handle_info({:inactivity, epoch}, %{inactivity_epoch: epoch} = state) do
+    notify(state, {:down, :inactivity_timeout})
+    {:stop, :normal, state}
+  end
+
+  def handle_info({:inactivity, _stale}, state), do: {:noreply, state}
 
   ## Frame dispatch
 
@@ -149,6 +173,16 @@ defmodule Athanor.P2P.Peer do
     {:ok, state}
   end
 
+  # A pong matching our in-flight keepalive ping clears it; pongs are never
+  # forwarded to the owner (they are protocol housekeeping).
+  defp handle_steady_frame(
+         %Frame{command: "pong", payload: <<nonce::little-64>>},
+         %{ping_nonce: nonce} = state
+       ),
+       do: {:ok, %{state | ping_nonce: nil}}
+
+  defp handle_steady_frame(%Frame{command: "pong"}, state), do: {:ok, state}
+
   defp handle_steady_frame(%Frame{} = frame, state) do
     notify(state, {:frame, frame})
     {:ok, state}
@@ -183,7 +217,10 @@ defmodule Athanor.P2P.Peer do
     cancel_timer(timer)
     notify(state, {:ready, peer_version})
     c.transport.send(socket, Frame.encode(c.network, :getaddr, <<>>))
+
     %{state | phase: :ready, hs_timer: nil, peer_version: peer_version}
+    |> arm_ping()
+    |> arm_inactivity()
   end
 
   ## Helpers
@@ -200,6 +237,30 @@ defmodule Athanor.P2P.Peer do
   defp rearm(%{config: c, socket: socket} = state) do
     c.transport.setopts(socket, active: :once)
     state
+  end
+
+  # Arm the keepalive ping timer if a `:ping_interval` is configured.
+  defp arm_ping(%{config: c} = state) do
+    case Map.get(c.timeouts, :ping_interval) do
+      nil -> state
+      interval -> %{state | ping_timer: Process.send_after(self(), :send_ping, interval)}
+    end
+  end
+
+  # (Re)arm the inactivity timer if an `:inactivity` timeout is configured. Each
+  # arming bumps the epoch so any already-queued timer message is ignored as
+  # stale — this is how an inbound frame "resets" the clock deterministically.
+  defp arm_inactivity(%{config: c} = state) do
+    case Map.get(c.timeouts, :inactivity) do
+      nil ->
+        state
+
+      timeout ->
+        cancel_timer(state.inactivity_timer)
+        epoch = state.inactivity_epoch + 1
+        timer = Process.send_after(self(), {:inactivity, epoch}, timeout)
+        %{state | inactivity_timer: timer, inactivity_epoch: epoch}
+    end
   end
 
   defp connect_timeout(%Config{timeouts: t}), do: Map.get(t, :connect, @default_connect_timeout)
