@@ -33,8 +33,8 @@ defmodule Athanor.P2P.Peer.LiveSmokeTest do
 
     our = our_version()
 
-    # Fan out to several candidates; real nodes are often unreachable, so the
-    # first to complete the handshake wins.
+    # Fan out to several candidates; real nodes are often unreachable, so we
+    # only need *one* connection to demonstrate ready → inv.
     for ip <- Enum.take(ips, @candidates) do
       config = %Peer.Config{
         host: ip,
@@ -50,11 +50,40 @@ defmodule Athanor.P2P.Peer.LiveSmokeTest do
       {:ok, _pid} = Peer.start_link(config)
     end
 
-    assert_receive {:peer, _pid, :ready, %Version{} = v}, 20_000
-    assert v.start_height > min_height(network)
-    assert v.user_agent =~ "/"
+    # Prove that a *single* peer both completed the handshake and then forwarded
+    # post-handshake traffic: the forwarded frame must come from a pid we already
+    # saw reach :ready (the Peer only forwards frames after the handshake and
+    # filters ping/pong, so any forwarded frame proves steady-state dispatch).
+    #
+    # We accept any forwarded frame rather than specifically an `inv`: an inv
+    # depends on live mempool activity (a quiet testnet may not relay one
+    # promptly), whereas real nodes reliably send sendheaders/feefilter/addr
+    # immediately after the handshake. We can't bind the first ready pid either
+    # — with a fanout, a different peer may forward sooner — so we accumulate
+    # ready pids and wait for a frame from one of them.
+    assert_ready_peer_forwards_a_frame(network)
+  end
 
-    assert_receive {:peer, _other, :frame, %Frame{command: "inv"}}, 10_000
+  # Wait for a forwarded frame from a peer that has already reached `:ready`.
+  defp assert_ready_peer_forwards_a_frame(network, ready \\ MapSet.new()) do
+    receive do
+      {:peer, pid, :ready, %Version{} = v} ->
+        assert v.start_height > min_height(network)
+        assert v.user_agent =~ "/"
+        assert_ready_peer_forwards_a_frame(network, MapSet.put(ready, pid))
+
+      {:peer, pid, :frame, %Frame{}} ->
+        if MapSet.member?(ready, pid) do
+          :ok
+        else
+          assert_ready_peer_forwards_a_frame(network, ready)
+        end
+
+      _other ->
+        assert_ready_peer_forwards_a_frame(network, ready)
+    after
+      25_000 -> flunk("no peer that reached :ready forwarded a frame within 25s")
+    end
   end
 
   defp pick_network do
