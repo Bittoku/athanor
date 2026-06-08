@@ -16,26 +16,9 @@ defmodule Athanor.P2P.RoundtripPropTest do
   @u32 0xFFFFFFFF
   @u64 0xFFFFFFFFFFFFFFFF
 
-  @commands [
-    :version,
-    :verack,
-    :ping,
-    :pong,
-    :protoconf,
-    :inv,
-    :getdata,
-    :notfound,
-    :reject,
-    :addr,
-    :getaddr,
-    :headers,
-    :getheaders,
-    :block,
-    :tx,
-    :mempool,
-    :sendheaders,
-    :feefilter
-  ]
+  # Derive the command set from the registry so the property cannot silently
+  # omit a known command (e.g. :getblocks) as the registry grows.
+  @commands Network.commands()
 
   property "VarInt round-trips and always uses the minimal width" do
     check all(n <- integer(0..@u64)) do

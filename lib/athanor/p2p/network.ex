@@ -106,6 +106,15 @@ defmodule Athanor.P2P.Network do
   def for_network(:testnet), do: testnet()
 
   @doc """
+  Returns every known wire command atom.
+
+  This is the single source of truth for the command set, so callers (e.g.
+  property tests over "any known command") cannot drift from the registry.
+  """
+  @spec commands() :: [atom()]
+  def commands, do: Map.keys(@commands)
+
+  @doc """
   Returns the wire command string for a known command atom.
   Raises `FunctionClauseError` on an unknown command.
   """
