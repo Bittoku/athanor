@@ -191,7 +191,11 @@ active-mode messages, and byte framing actually work together.
 **RED/GREEN:** `@tag :external` (excluded by default per T1.S):
 - **Default network = testnet** (matches `config/runtime.exs:29`): connect `Peer` to a seed-resolved
   **testnet** node; `assert_receive {:peer, _, :ready, v}, 10_000` with `v.start_height > 1_600_000`
-  (testnet3) and `v.user_agent =~ "/"`; expect at least one inbound `inv` within a few seconds.
+  (testnet3) and `v.user_agent =~ "/"`; expect **that same peer** to forward at least one
+  **post-handshake application frame** within a few seconds. (Contract is "any forwarded frame", not
+  `inv` specifically: an `inv` depends on live mempool activity and is flaky on a quiet testnet, whereas
+  nodes reliably send `sendheaders`/`feefilter` post-handshake. The deterministic inbound-`inv` assertion
+  — with its hash — lives in **T1.7**'s loopback test against a `FakePeerServer` that always sends one.)
 - **Mainnet variant is opt-in:** same test parameterized for `mainnet()` (`start_height > 800_000`),
   selected via env (e.g. `P2P_SMOKE_NETWORK=mainnet`) so it doesn't run unless explicitly requested.
 - Documents the one true external dependency check; run with `mix test --only external`.
