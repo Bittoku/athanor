@@ -63,7 +63,10 @@ defmodule Athanor.MixProject do
       {:req, "~> 0.5"},
 
       # Rate limiting — per-endpoint throttling for API protection
-      {:hammer, "~> 6.2"}
+      {:hammer, "~> 6.2"},
+
+      # Property-based testing — round-trip invariants for the P2P wire codec
+      {:stream_data, "~> 1.0", only: :test}
     ]
   end
 
