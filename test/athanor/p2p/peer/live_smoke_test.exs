@@ -9,9 +9,17 @@ defmodule Athanor.P2P.Peer.LiveSmokeTest do
 
   It resolves the network's DNS seeds, opens real `Peer` connections to several
   candidate nodes, and asserts that at least one completes the handshake with a
-  sane advertised `version` and that an `inv` arrives shortly after. This is the
-  one true external-dependency check; a failure here where T1.7 passed points at
-  magic/seed/user-agent issues, not framing.
+  sane advertised `version` and that **the same peer** then forwards a
+  post-handshake application frame (proving steady-state dispatch over a real
+  socket). This is the one true external-dependency check; a failure here where
+  T1.7 passed points at magic/seed/user-agent issues, not framing.
+
+  Note: it intentionally accepts *any* forwarded frame rather than an `inv`
+  specifically. The `Peer` only forwards post-handshake, non-ping/pong frames,
+  so any forwarded frame proves dispatch, whereas an `inv` depends on live
+  mempool activity and is flaky on a quiet testnet. The deterministic
+  inbound-`inv` assertion (with its hash) lives in the T1.7 loopback test, which
+  drives a `FakePeerServer` that always sends one.
 
   Network defaults to **testnet** (matching the repo's runtime default); set
   `P2P_SMOKE_NETWORK=mainnet` to run the mainnet variant instead.
@@ -26,7 +34,7 @@ defmodule Athanor.P2P.Peer.LiveSmokeTest do
 
   @tag :external
   @tag timeout: 60_000
-  test "reaches :ready against a live node and receives an inv" do
+  test "reaches :ready against a live node and forwards a post-handshake frame" do
     network = pick_network()
     ips = resolve_seed_ips(network)
     assert ips != [], "no seed IPs resolved for #{network.name}"
