@@ -24,6 +24,7 @@ defmodule Athanor.Application do
         {Registry, keys: :duplicate, name: Athanor.Subscriptions}
       ] ++
         runtime_children() ++
+        p2p_children() ++
         [
           # Phoenix endpoint — must be last
           AthanorWeb.Endpoint
@@ -52,6 +53,16 @@ defmodule Athanor.Application do
         # Infra: Finch HTTP pool, JungleBus client (:one_for_one)
         Athanor.Infra.Supervisor
       ]
+    end
+  end
+
+  # The P2P peer pool runs as a config-gated sibling supervisor, off by default
+  # (enable with `config :athanor, Athanor.P2P, enabled: true`).
+  defp p2p_children do
+    if Athanor.P2P.Supervisor.enabled?() do
+      [{Athanor.P2P.Supervisor, []}]
+    else
+      []
     end
   end
 
