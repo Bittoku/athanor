@@ -84,6 +84,54 @@ defmodule Athanor.Indexer.TransactionProcessor do
   defp do_index_tx(tx, matched_addresses, matched_tokens, block_height, source) do
     txid_binary = Transaction.txid_binary(tx)
     txid_hex = Transaction.tx_id_hex(tx)
+
+    # Source tagging + dedupe (plan §2.5): first observation indexes fully;
+    # a re-observation of the SAME txid (e.g. seen via REST then P2P) must only
+    # union its `source` into `metadata["sources"]` and return — WITHOUT
+    # replaying first-index side effects (input spends, UTXO creation,
+    # address-history rows, PubSub, waiter reprocessing) and WITHOUT touching
+    # the confirmation columns (`is_confirmed`/`block_height`), which are owned
+    # by the block processor. First-seen wins for indexing; duplicates only add
+    # their source. No schema migration.
+    case Repo.get_by(MetaTransaction, txid: txid_binary) do
+      %MetaTransaction{} = existing ->
+        union_source_only(existing, source)
+        {:ok, txid_hex}
+
+      nil ->
+        index_new_tx(
+          tx,
+          matched_addresses,
+          matched_tokens,
+          block_height,
+          source,
+          txid_binary,
+          txid_hex
+        )
+    end
+  end
+
+  # Re-observation path. Union `source` into the existing row's
+  # `metadata["sources"]` set and persist nothing else.
+  defp union_source_only(%MetaTransaction{} = existing, source) do
+    new_metadata = Map.put(existing.metadata || %{}, "sources", merge_sources(existing, source))
+
+    existing
+    |> MetaTransaction.changeset(%{metadata: new_metadata})
+    |> Repo.update()
+  end
+
+  # First-index path: the full pipeline (meta insert → input spends → UTXO
+  # creation → address history → PubSub → waiter reprocessing).
+  defp index_new_tx(
+         tx,
+         matched_addresses,
+         matched_tokens,
+         block_height,
+         source,
+         txid_binary,
+         txid_hex
+       ) do
     tx_hex = Transaction.to_hex(tx)
 
     # Classify all outputs
@@ -100,12 +148,8 @@ defmodule Athanor.Indexer.TransactionProcessor do
     # the naive script-derived tag).
     stas_attrs = compute_stas_attributes(tx, classified)
 
-    # 1. Store MetaTransaction. Source tagging (plan §2.5): union the observing
-    # `source` into `metadata["sources"]` (a set) — first-seen wins for indexing,
-    # later duplicates only add their source. No schema migration.
-    existing = Repo.get_by(MetaTransaction, txid: txid_binary)
-    sources = merge_sources(existing, source)
-
+    # 1. Store MetaTransaction (first sight). Seed `metadata["sources"]` with the
+    # observing source.
     meta_attrs = %{
       txid: txid_binary,
       hex: tx_hex,
@@ -114,21 +158,13 @@ defmodule Athanor.Indexer.TransactionProcessor do
       timestamp: System.os_time(:second),
       addresses: all_addresses,
       token_ids: all_token_ids,
-      metadata: Map.put(stas_attrs.flags, "sources", sources)
+      metadata: Map.put(stas_attrs.flags, "sources", merge_sources(nil, source))
     }
 
     _meta_result =
-      case existing do
-        nil ->
-          %MetaTransaction{}
-          |> MetaTransaction.changeset(meta_attrs)
-          |> Repo.insert()
-
-        existing ->
-          existing
-          |> MetaTransaction.changeset(meta_attrs)
-          |> Repo.update()
-      end
+      %MetaTransaction{}
+      |> MetaTransaction.changeset(meta_attrs)
+      |> Repo.insert()
 
     # 2. Process inputs — mark UTXOs as spent. STAS 3.0 spec v0.1 §8.2 / §9.6:
     # the unlocking script encodes a `spendType` byte that classifies the
@@ -321,8 +357,14 @@ defmodule Athanor.Indexer.TransactionProcessor do
 
       now_resolved? = stas_attrs.flags["all_stas_inputs_known"] == true
 
+      # Recompute the lineage flags but PRESERVE unrelated metadata keys —
+      # especially `"sources"` (Phase 3 §A). Fresh flags win on conflicting
+      # keys (`is_stas`, `illegal_roots`, `missing_transactions`, …); the
+      # source set and any other non-flag keys survive.
+      merged_metadata = Map.merge(waiter.metadata || %{}, stas_attrs.flags)
+
       waiter
-      |> MetaTransaction.changeset(%{metadata: stas_attrs.flags})
+      |> MetaTransaction.changeset(%{metadata: merged_metadata})
       |> Repo.update()
 
       Enum.each(stas_attrs.token_id_per_vout, fn {vout, new_token_id} ->

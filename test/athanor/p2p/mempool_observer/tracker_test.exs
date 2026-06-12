@@ -4,6 +4,10 @@ defmodule Athanor.P2P.MempoolObserver.TrackerTest do
   `Athanor.P2P.MempoolObserver.Tracker` (Phase 3 T3.2, §B). `step(state, event,
   now_ms) -> {state, actions}` with no process and no IO; time is injected.
 
+  Peer-matched delivery (the !11 review's blocker 3): an outstanding request is
+  bound to the peer it was sent to; a `tx`/`notfound` from a different peer is
+  ignored and leaves the request outstanding.
+
   Key invariant (the !10 review's blocker 2): `seen` is set **only** on a
   successful `tx`. A failure (`notfound`/timeout/peer-down) clears `outstanding`
   without marking `seen`, so a *different* peer's later `inv` can re-request —
@@ -75,6 +79,37 @@ defmodule Athanor.P2P.MempoolObserver.TrackerTest do
       # peerA's txid(1) is re-requestable; peerB's txid(2) is still outstanding.
       assert {_s, [{:getdata, :peerC, _}]} = Tracker.step(state, {:inv, txid(1), :peerC}, 2)
       assert {^state, []} = Tracker.step(state, {:inv, txid(2), :peerC}, 2)
+    end
+  end
+
+  describe "peer-matched lifecycle (the !11 review's blocker 3)" do
+    test "a notfound from the wrong peer does NOT cancel the asked peer's request" do
+      # Asked peerA for txid(1). A stranger peerB says notfound.
+      {state, _} = Tracker.step(new(), {:inv, txid(1), :peerA}, 0)
+      {state, actions} = Tracker.step(state, {:notfound, txid(1), :peerB}, 1)
+
+      # The wrong-peer notfound is ignored and the request stays outstanding,
+      # so peerA's later tx still ingests.
+      assert actions == []
+      {_state, ingest} = Tracker.step(state, {:tx, txid(1), "raw", :peerA}, 2)
+      assert ingest == [{:ingest, "raw"}]
+    end
+
+    test "a tx from the wrong peer does NOT satisfy the asked peer's request" do
+      # Asked peerA for txid(1). An unsolicited tx arrives from peerB.
+      {state, _} = Tracker.step(new(), {:inv, txid(1), :peerA}, 0)
+      {state, actions} = Tracker.step(state, {:tx, txid(1), "raw-from-B", :peerB}, 1)
+
+      # Ignored; request stays outstanding so the asked peer can still deliver.
+      assert actions == []
+      {_state, ingest} = Tracker.step(state, {:tx, txid(1), "raw-from-A", :peerA}, 2)
+      assert ingest == [{:ingest, "raw-from-A"}]
+    end
+
+    test "the correct peer's notfound still clears the request (recovery preserved)" do
+      {state, _} = Tracker.step(new(), {:inv, txid(1), :peerA}, 0)
+      {state, []} = Tracker.step(state, {:notfound, txid(1), :peerA}, 1)
+      assert {_s, [{:getdata, :peerB, _}]} = Tracker.step(state, {:inv, txid(1), :peerB}, 2)
     end
   end
 

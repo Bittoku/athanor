@@ -26,6 +26,15 @@ defmodule Athanor.P2P.MempoolObserver.Tracker do
   (`notfound`/`timeout`/`peer_down`) clears `outstanding` and leaves the txid
   neither outstanding nor seen, so a *different* peer's later `inv` re-requests
   it (recovery), while a flood of simultaneous `inv`s is still collapsed to one.
+
+  ## Peer-matched delivery
+
+  An outstanding request is bound to the peer it was sent to. Only that peer can
+  satisfy or cancel it: a `tx` or `notfound` carrying a *different* peer is
+  ignored and leaves the request outstanding (so the asked peer — or a later
+  recovery `inv` — can still deliver). This keeps request accounting
+  peer-unambiguous: a stranger's `notfound` cannot cancel peer A's in-flight
+  request, and an unsolicited `tx` cannot mark another peer's request complete.
   """
 
   defstruct outstanding: %{},
@@ -69,8 +78,11 @@ defmodule Athanor.P2P.MempoolObserver.Tracker do
     end
   end
 
-  def step(%__MODULE__{} = state, {:tx, txid, payload, _peer}, now_ms) do
-    if Map.has_key?(state.outstanding, txid) do
+  def step(%__MODULE__{} = state, {:tx, txid, payload, peer}, now_ms) do
+    # Only the peer we asked can satisfy the request. An unsolicited / stale
+    # `tx` from a different peer is ignored and leaves the request outstanding,
+    # so the asked peer (or a later recovery) can still deliver.
+    if requested_from?(state, txid, peer) do
       state = %{
         state
         | outstanding: Map.delete(state.outstanding, txid),
@@ -83,8 +95,15 @@ defmodule Athanor.P2P.MempoolObserver.Tracker do
     end
   end
 
-  def step(%__MODULE__{} = state, {:notfound, txid, _peer}, _now_ms),
-    do: {drop_outstanding(state, txid), []}
+  # A `notfound` only cancels the request if it comes from the peer we asked;
+  # a stranger peer's `notfound` must not cancel peer A's in-flight request.
+  def step(%__MODULE__{} = state, {:notfound, txid, peer}, _now_ms) do
+    if requested_from?(state, txid, peer) do
+      {drop_outstanding(state, txid), []}
+    else
+      {state, []}
+    end
+  end
 
   def step(%__MODULE__{} = state, {:timeout, txid}, _now_ms),
     do: {drop_outstanding(state, txid), []}
@@ -115,6 +134,14 @@ defmodule Athanor.P2P.MempoolObserver.Tracker do
 
   defp drop_outstanding(state, txid),
     do: %{state | outstanding: Map.delete(state.outstanding, txid)}
+
+  # True iff `txid` is outstanding AND was requested from exactly `peer`.
+  defp requested_from?(state, txid, peer) do
+    case Map.get(state.outstanding, txid) do
+      {^peer, _at} -> true
+      _ -> false
+    end
+  end
 
   defp seen?(state, txid, now_ms) do
     case Map.get(state.seen, txid) do
