@@ -115,8 +115,17 @@ target echo can never satisfy the bar:
 
 ## §C — Broadcast integration contract (`services/broadcast.ex`)
 
-`broadcast_tx/2` keeps its **`raw_tx_hex`** entry signature, audit-row, and return shape. The broadcast path
-becomes **P2P-primary, REST/RPC fallback**, behind an injected seam so tests need no node.
+**Normative public API (blocker — arity).** On `main` the public entrypoint is `broadcast_tx(raw_tx_hex)`
+(arity 1), called by `transaction_controller.ex:68` and `wallet_channel.ex:203`; there is **no** dependency
+seam today. Phase 4 changes it to **`broadcast_tx(raw_tx_hex, opts \\ [])`** — a backward-compatible default
+second arg, so the **two existing arity-1 callers keep working unchanged** (T4.2 asserts this) and the
+audit-row + return shape are preserved. The new `opts` carry the test/runtime seams (both **new** in Phase 4;
+neither exists on `main`):
+- `:relay` — `(txid, raw_bin -> :ok)` (default: a cast to the supervised `TxRelay`);
+- `:broadcaster` — `(raw_tx_hex -> {:ok, txid} | {:error, reason})` (default: `&RpcClient.send_raw_transaction/1`,
+  i.e. exactly today's direct call), so tests exercise the RPC path without a node.
+This stays **one** public broadcast API; P2P-vs-RPC is a routing decision inside it. The broadcast path
+becomes **P2P-primary, REST/RPC fallback**.
 
 **Decode-once boundary + upstream validation (blockers — hex/wire bytes & the error path).**
 `broadcast_tx/2` parses `raw_tx_hex` **exactly once** into a `%BSV.Transaction{}` (as it does today) and
@@ -195,8 +204,11 @@ update the schema moduledoc. `status` is a plain string column (no PG enum), so 
 T4.2 must confirm this** (a `mix ecto` check); add one only if the column is constrained.
 **RED:** `broadcast_test.exs` additions —
 - each new status (`relayed`/`propagated`/`unconfirmed`) **persists through `Broadcast.changeset/2`**;
+- **backward-compat arity:** `broadcast_tx(raw_tx_hex)` (arity 1, the existing controller/channel callers)
+  still works and behaves exactly as today when no `opts` are given;
 - P2P-enabled + live peers → relay invoked + row `relayed` (+ the RPC fallback still called);
-- **P2P disabled / zero peers → RPC-only, row exactly as today** (cold-start safety);
+- **P2P disabled / zero peers → RPC-only, row exactly as today** (cold-start safety), via the default
+  `:broadcaster` (`&RpcClient.send_raw_transaction/1`);
 - **precedence (monotonic, never downgrades):** a `relayed` row that the RPC fallback then accepts ends
   `accepted`; a later `:propagated` lifts it to `propagated`; a TTL `:unconfirmed` does **not** override an
   `accepted`/`propagated` row; a `:propagated`/`:unconfirmed`/`:rejected` event applies via the precedence;
@@ -233,7 +245,10 @@ tx). `mix test --only external`; mainnet opt-in via `P2P_SMOKE_NETWORK=mainnet`.
   relay-back peer ∉ `announced_to`, so a target echo can never flip the status.
 - Cold-start safety: with P2P primary **and zero peers**, `broadcast_tx` still works via RPC/REST fallback,
   byte-for-byte as today.
-- The §A fan-out keeps Phase 2/3 behavior unchanged for single-sink/`nil` configs; one broadcast public API.
+- The §A fan-out keeps Phase 2/3 behavior unchanged for single-sink/`nil` configs.
+- **One broadcast public API:** `broadcast_tx(raw_tx_hex, opts \\ [])` — the existing arity-1 callers
+  (`transaction_controller`, `wallet_channel`) work unchanged (asserted); `:relay`/`:broadcaster` are
+  Phase-4-new injected seams, both defaulting to today's behavior.
 - **Normative event shape:** the reducer and `TxRelay` agree on `{:broadcast, txid, raw_bin, targets, bar}`
   (`bar` stored in `pending`, not re-derived); T4.0/T4.1 assert it for N≥3, N==2, N==1, and once-only
   propagation.
