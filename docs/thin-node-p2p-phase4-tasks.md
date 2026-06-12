@@ -123,7 +123,13 @@ audit-row + return shape are preserved. The new `opts` carry the test/runtime se
 neither exists on `main`):
 - `:relay` — `(txid, raw_bin -> :ok)` (default: a cast to the supervised `TxRelay`);
 - `:broadcaster` — `(raw_tx_hex -> {:ok, txid} | {:error, reason})` (default: `&RpcClient.send_raw_transaction/1`,
-  i.e. exactly today's direct call), so tests exercise the RPC path without a node.
+  i.e. exactly today's direct call), so tests exercise the RPC path without a node;
+- `:rpc_fallback?` — `boolean` (**default `true`**; runtime default also overridable via
+  `config :athanor, Athanor.P2P, rpc_fallback: true`). When `true`, the `:broadcaster` is invoked as the
+  belt-and-suspenders fallback **even on the P2P-relay path**; when `false`, the `:broadcaster` is **not**
+  called once the tx is relayed via P2P (≥1 live peer) — propagation must then be confirmed by the P2P
+  relay-back alone. `:rpc_fallback?` only gates the *post-relay* fallback; the **cold-start path** (P2P
+  disabled or zero peers) always calls `:broadcaster` regardless, so cold-start safety is never disabled.
 This stays **one** public broadcast API; P2P-vs-RPC is a routing decision inside it. The broadcast path
 becomes **P2P-primary, REST/RPC fallback**.
 
@@ -142,8 +148,10 @@ before anything async:
   (no "announce X, serve Y" and no "hash the hex" class of bug).
 
 - When P2P is enabled and ≥1 live peer exists: announce via the relay, mark the row `status: "relayed"`; the
-  RPC/REST `broadcaster` still runs as the **belt-and-suspenders fallback** (BSV nodes dedupe a tx they
-  already saw via P2P, so double-submit is safe) **unless** config opts out.
+  RPC/REST `broadcaster` then runs as the **belt-and-suspenders fallback** (BSV nodes dedupe a tx they
+  already saw via P2P, so double-submit is safe) **iff `:rpc_fallback?` is `true`** (the default). With
+  `:rpc_fallback?: false` the `:broadcaster` is skipped on this path (used by T4.3 to isolate the
+  propagation proof).
 - When P2P is disabled or there are **zero** live peers (cold start), behavior is **exactly today's** —
   RPC/REST only. This is the cold-start-safety rule carried from DXS; it is the headline T4.2 test.
 
@@ -206,7 +214,9 @@ T4.2 must confirm this** (a `mix ecto` check); add one only if the column is con
 - each new status (`relayed`/`propagated`/`unconfirmed`) **persists through `Broadcast.changeset/2`**;
 - **backward-compat arity:** `broadcast_tx(raw_tx_hex)` (arity 1, the existing controller/channel callers)
   still works and behaves exactly as today when no `opts` are given;
-- P2P-enabled + live peers → relay invoked + row `relayed` (+ the RPC fallback still called);
+- P2P-enabled + live peers, **default `:rpc_fallback?` (`true`)** → relay invoked + row `relayed`, **and the
+  `:broadcaster` is still called** (belt-and-suspenders); a separate case with `:rpc_fallback?: false` →
+  relay invoked but `:broadcaster` **not** called;
 - **P2P disabled / zero peers → RPC-only, row exactly as today** (cold-start safety), via the default
   `:broadcaster` (`&RpcClient.send_raw_transaction/1`);
 - **precedence (monotonic, never downgrades):** a `relayed` row that the RPC fallback then accepts ends
@@ -225,7 +235,7 @@ rule yields real non-targets (announce to `N−2`, hold back 2). `FakePeerServer
 **held-back** servers send `inv(our_txid)` → the relay counts those (and **ignores** any echo from the
 announce target) → marks `:propagated` → audit row `propagated`. The test asserts the relay-back peers were
 **not** in `announced_to` (so target echo cannot be what flips the status).
-**The RPC/REST fallback is disabled/stubbed for this test** (a `broadcaster` that flunks if called), and the
+**The RPC fallback is opted out via `:rpc_fallback?: false`** with a `:broadcaster` stub that flunks if called, and the
 test **asserts it was never called** — so `:propagated` is proven to come through the P2P announce→relay-back
 path, not the node/RPC path. (The belt-and-suspenders fallback behavior is covered separately in T4.2.)
 
@@ -258,9 +268,13 @@ tx). `mix test --only external`; mainnet opt-in via `P2P_SMOKE_NETWORK=mainnet`.
   upstream: invalid hex/unparseable tx → row `rejected` (`error: "invalid raw transaction"`) with **no** relay,
   **no** `inv`, **no** RPC call — tested for valid and invalid input. The relay seam `(txid, raw_bin -> :ok)`
   is fire-and-forget (never returns a parse error).
-- **Propagation proof isolation:** the T4.3 round-trip disables/stubs the RPC fallback and asserts it is
-  **never called**, so `:propagated` is proven via the P2P announce→non-target-relay-back path, not the node
-  path. Any peer ∉ `announced_to` counts (hold-back only guarantees ≥`bar` non-targets exist).
+- **Fallback control contract:** `:rpc_fallback?` (default `true`; config `rpc_fallback`) gates the
+  *post-relay* belt-and-suspenders `:broadcaster` call only — the cold-start path always calls it. T4.2
+  asserts default-`true` calls `:broadcaster` on the live-peer path and `false` skips it; T4.3 sets `false`.
+- **Propagation proof isolation:** the T4.3 round-trip sets `:rpc_fallback?: false` (with a `:broadcaster`
+  stub that flunks if called) and asserts it is **never called**, so `:propagated` is proven via the P2P
+  announce→non-target-relay-back path, not the node path. Any peer ∉ `announced_to` counts (hold-back only
+  guarantees ≥`bar` non-targets exist).
 - **Audit status contract:** `Broadcast.changeset/2` accepts `pending|relayed|propagated|unconfirmed|
   accepted|rejected`, all persisting; transitions follow the monotonic precedence
   `pending<relayed<accepted<propagated` (with `unconfirmed`/`rejected` only below `accepted`); no migration
