@@ -26,10 +26,16 @@ defmodule Athanor.Indexer.TransactionProcessor do
   end
 
   @doc """
-  Synchronously process a transaction (for block processing).
+  Synchronously process a transaction (for block processing). `source` tags the
+  observation's provider (`:p2p | :zmq | :junglebus | :bitails | :block |
+  :unknown`); it is recorded in `MetaTransaction.metadata["sources"]`.
   """
-  def process_tx(tx, matched_addresses, matched_tokens) do
-    GenServer.call(__MODULE__, {:process_tx, tx, matched_addresses, matched_tokens}, 30_000)
+  def process_tx(tx, matched_addresses, matched_tokens, source \\ :unknown) do
+    GenServer.call(
+      __MODULE__,
+      {:process_tx, tx, matched_addresses, matched_tokens, source},
+      30_000
+    )
   end
 
   ## ── Server Callbacks ──
@@ -40,16 +46,24 @@ defmodule Athanor.Indexer.TransactionProcessor do
   end
 
   @impl true
-  def handle_cast({:index_tx, tx, matched_addresses, matched_tokens}, state) do
-    do_index_tx(tx, matched_addresses, matched_tokens, nil)
+  def handle_cast({:index_tx, tx, matched_addresses, matched_tokens, source}, state) do
+    do_index_tx(tx, matched_addresses, matched_tokens, nil, source)
     {:noreply, %{state | processed_count: state.processed_count + 1}}
   end
 
+  # Back-compat: a 4-tuple cast (no source) defaults to :unknown.
+  def handle_cast({:index_tx, tx, matched_addresses, matched_tokens}, state),
+    do: handle_cast({:index_tx, tx, matched_addresses, matched_tokens, :unknown}, state)
+
   @impl true
-  def handle_call({:process_tx, tx, matched_addresses, matched_tokens}, _from, state) do
-    result = do_index_tx(tx, matched_addresses, matched_tokens, nil)
+  def handle_call({:process_tx, tx, matched_addresses, matched_tokens, source}, _from, state) do
+    result = do_index_tx(tx, matched_addresses, matched_tokens, nil, source)
     {:reply, result, %{state | processed_count: state.processed_count + 1}}
   end
+
+  # Back-compat: a 4-tuple call (no source) defaults to :unknown.
+  def handle_call({:process_tx, tx, matched_addresses, matched_tokens}, from, state),
+    do: handle_call({:process_tx, tx, matched_addresses, matched_tokens, :unknown}, from, state)
 
   @impl true
   def handle_info(_msg, state) do
@@ -58,7 +72,16 @@ defmodule Athanor.Indexer.TransactionProcessor do
 
   ## ── Private ──
 
-  defp do_index_tx(tx, matched_addresses, matched_tokens, block_height) do
+  # Unions a new `source` into the existing `metadata["sources"]` set (or seeds
+  # it on first sight). Order-independent; deduped.
+  defp merge_sources(nil, source), do: [to_string(source)]
+
+  defp merge_sources(%MetaTransaction{metadata: metadata}, source) do
+    existing = (is_map(metadata) && Map.get(metadata, "sources")) || []
+    Enum.uniq(existing ++ [to_string(source)])
+  end
+
+  defp do_index_tx(tx, matched_addresses, matched_tokens, block_height, source) do
     txid_binary = Transaction.txid_binary(tx)
     txid_hex = Transaction.tx_id_hex(tx)
     tx_hex = Transaction.to_hex(tx)
@@ -77,7 +100,12 @@ defmodule Athanor.Indexer.TransactionProcessor do
     # the naive script-derived tag).
     stas_attrs = compute_stas_attributes(tx, classified)
 
-    # 1. Store MetaTransaction
+    # 1. Store MetaTransaction. Source tagging (plan §2.5): union the observing
+    # `source` into `metadata["sources"]` (a set) — first-seen wins for indexing,
+    # later duplicates only add their source. No schema migration.
+    existing = Repo.get_by(MetaTransaction, txid: txid_binary)
+    sources = merge_sources(existing, source)
+
     meta_attrs = %{
       txid: txid_binary,
       hex: tx_hex,
@@ -86,11 +114,11 @@ defmodule Athanor.Indexer.TransactionProcessor do
       timestamp: System.os_time(:second),
       addresses: all_addresses,
       token_ids: all_token_ids,
-      metadata: stas_attrs.flags
+      metadata: Map.put(stas_attrs.flags, "sources", sources)
     }
 
     _meta_result =
-      case Repo.get_by(MetaTransaction, txid: txid_binary) do
+      case existing do
         nil ->
           %MetaTransaction{}
           |> MetaTransaction.changeset(meta_attrs)
