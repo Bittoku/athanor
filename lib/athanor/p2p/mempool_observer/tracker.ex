@@ -9,7 +9,8 @@ defmodule Athanor.P2P.MempoolObserver.Tracker do
   `step(state, event, now_ms) -> {state, actions}` where:
 
     * events — `{:inv, txid, peer}`, `{:tx, txid, payload, peer}`,
-      `{:notfound, txid, peer}`, `{:timeout, txid}`, `{:peer_down, peer}`, `:tick`.
+      `{:notfound, txid, peer}`, `{:timeout, txid, peer, requested_at}`,
+      `{:peer_down, peer}`, `:tick`.
     * actions — `[{:getdata, peer, txid}]` | `[{:ingest, payload}]` | `[]`.
 
   ## State (the in-flight / completed split)
@@ -105,8 +106,17 @@ defmodule Athanor.P2P.MempoolObserver.Tracker do
     end
   end
 
-  def step(%__MODULE__{} = state, {:timeout, txid}, _now_ms),
-    do: {drop_outstanding(state, txid), []}
+  # A per-request timeout is scoped to the request *generation* — the
+  # `{peer, requested_at}` identity stored when the `getdata` was sent. It clears
+  # the outstanding entry only if it still matches, so a stale timer (armed for a
+  # request since cleared by `notfound`/`peer_down` and superseded by another
+  # peer's re-`inv`) cannot erase the newer outstanding request.
+  def step(%__MODULE__{} = state, {:timeout, txid, peer, requested_at}, _now_ms) do
+    case Map.get(state.outstanding, txid) do
+      {^peer, ^requested_at} -> {drop_outstanding(state, txid), []}
+      _ -> {state, []}
+    end
+  end
 
   def step(%__MODULE__{} = state, {:peer_down, peer}, _now_ms) do
     outstanding = Map.reject(state.outstanding, fn {_txid, {p, _at}} -> p == peer end)

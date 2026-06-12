@@ -19,6 +19,10 @@ defmodule Athanor.P2P.PeerPool.Config do
       before it is eligible to redial (default 15 min).
     * `:now_fun` — `fn -> integer_ms` clock (default monotonic ms); injected in
       tests to drive cooldown deterministically.
+    * `:frame_sink` — optional `pid` or registered name (Phase 3, §C). When set,
+      every post-handshake application frame is forwarded to it as
+      `{:peer, pid, :frame, %Frame{}}` (the pool still owns peer lifecycle); the
+      `MempoolObserver` registers here. `nil` (default) leaves behavior unchanged.
   """
 
   alias Athanor.P2P.Network
@@ -50,6 +54,6 @@ defmodule Athanor.P2P.PeerPool.Config do
           seeds: [addr()],
           cooldown_ms: non_neg_integer(),
           now_fun: (-> integer()) | nil,
-          frame_sink: pid() | nil
+          frame_sink: pid() | atom() | nil
         }
 end
