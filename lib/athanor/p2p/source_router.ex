@@ -87,4 +87,53 @@ defmodule Athanor.P2P.SourceRouter do
     overrides = Application.get_env(:athanor, __MODULE__, [])[:routes] || %{}
     Map.merge(@defaults, overrides)
   end
+
+  @doc """
+  Runs `attempt_fun` against the resolved providers for `capability`, in order
+  (primary then each fallback), returning the **first** `{:ok, result}`. A
+  provider that answers `:miss` (no data) or `{:error, reason}` advances to the
+  next; if none succeed, returns the **last** `{:error, _}` seen, or `:miss` if
+  every provider merely missed.
+
+  A `:p2p` provider is **skipped as an instant miss** when `p2p_available?` is
+  false (P2P disabled or zero live peers) — this is the single cold-start gate, so
+  a P2P-primary route never blocks when there are no peers.
+
+  ## Parameters
+    - `capability` — the capability to resolve and route.
+    - `attempt_fun` — `(provider -> {:ok, result} | :miss | {:error, reason})`.
+    - `opts` — `:p2p_available?` (a boolean or 0-arity fun; default
+      `Supervisor.enabled?/0 and PeerRegistry.pids/1 != []`).
+
+  ## Returns
+    `{:ok, result} | {:error, reason} | :miss`.
+  """
+  @spec route(capability(), (provider() -> {:ok, term()} | :miss | {:error, term()}), keyword()) ::
+          {:ok, term()} | {:error, term()} | :miss
+  def route(capability, attempt_fun, opts \\ []) when is_function(attempt_fun, 1) do
+    {primary, fallbacks} = resolve(capability)
+    do_route([primary | fallbacks], attempt_fun, opts, :miss)
+  end
+
+  defp do_route([], _attempt_fun, _opts, last), do: last
+
+  defp do_route([provider | rest], attempt_fun, opts, last) do
+    if provider == :p2p and not p2p_available?(opts) do
+      do_route(rest, attempt_fun, opts, last)
+    else
+      case attempt_fun.(provider) do
+        {:ok, _result} = ok -> ok
+        :miss -> do_route(rest, attempt_fun, opts, last)
+        {:error, _reason} = err -> do_route(rest, attempt_fun, opts, err)
+      end
+    end
+  end
+
+  defp p2p_available?(opts) do
+    case Keyword.fetch(opts, :p2p_available?) do
+      {:ok, fun} when is_function(fun, 0) -> fun.()
+      {:ok, bool} when is_boolean(bool) -> bool
+      :error -> Athanor.P2P.Supervisor.enabled?() and Athanor.P2P.PeerRegistry.pids() != []
+    end
+  end
 end

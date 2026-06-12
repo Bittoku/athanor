@@ -61,4 +61,67 @@ defmodule Athanor.P2P.SourceRouterTest do
     assert SourceRouter.resolve(:raw_tx_fetch) == {:p2p, [:rpc, :junglebus, :whatsonchain]}
     assert SourceRouter.resolve(:validation_fetch) == {:rpc, []}
   end
+
+  describe "route/3 runner" do
+    # raw_tx_fetch default = {:p2p, [:rpc, :junglebus, :whatsonchain]}.
+
+    test "a primary :ok short-circuits — fallbacks are never attempted" do
+      {:ok, _} = Agent.start_link(fn -> [] end, name: :route_log)
+      record = fn p -> Agent.update(:route_log, &[p | &1]) end
+
+      result =
+        SourceRouter.route(
+          :raw_tx_fetch,
+          fn p ->
+            record.(p)
+            if p == :p2p, do: {:ok, "hit"}, else: :miss
+          end,
+          p2p_available?: true
+        )
+
+      assert result == {:ok, "hit"}
+      assert Agent.get(:route_log, & &1) == [:p2p]
+    end
+
+    test "a :p2p primary is skipped (instant miss) when p2p_available? is false" do
+      attempted =
+        SourceRouter.route(
+          :raw_tx_fetch,
+          fn
+            :p2p -> flunk(":p2p must not be attempted when unavailable")
+            :rpc -> {:ok, "rpc"}
+            _ -> :miss
+          end,
+          p2p_available?: false
+        )
+
+      assert attempted == {:ok, "rpc"}
+    end
+
+    test "advances through fallbacks in order on :miss, returning the first :ok" do
+      {:ok, _} = Agent.start_link(fn -> [] end, name: :route_order)
+
+      result =
+        SourceRouter.route(
+          :raw_tx_fetch,
+          fn p ->
+            Agent.update(:route_order, &(&1 ++ [p]))
+            if p == :junglebus, do: {:ok, "jb"}, else: :miss
+          end,
+          p2p_available?: true
+        )
+
+      assert result == {:ok, "jb"}
+      assert Agent.get(:route_order, & &1) == [:p2p, :rpc, :junglebus]
+    end
+
+    test "all providers miss → :miss" do
+      assert SourceRouter.route(:raw_tx_fetch, fn _ -> :miss end, p2p_available?: true) == :miss
+    end
+
+    test "all providers error → the last error is returned" do
+      assert SourceRouter.route(:raw_tx_fetch, fn p -> {:error, p} end, p2p_available?: true) ==
+               {:error, :whatsonchain}
+    end
+  end
 end
