@@ -36,6 +36,10 @@ defmodule Athanor.P2P.FakePeerServer do
     # the pool integration test); when false (default), close after pong to
     # exercise the client's :closed path (Phase 1 T1.7).
     linger = Keyword.get(opts, :linger, false)
+    # When set, a `getdata` from the client is answered with this raw `tx`
+    # payload (Phase 3 T3.4: prove the observer's inv→getdata→tx exchange). When
+    # nil (default), `getdata` is ignored, leaving every prior test unchanged.
+    tx_payload = Keyword.get(opts, :tx_payload)
 
     {:ok, listen} =
       :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, packet: :raw])
@@ -48,7 +52,8 @@ defmodule Athanor.P2P.FakePeerServer do
       peer_version: peer_version,
       inv_hash: inv_hash,
       ping_nonce: ping_nonce,
-      linger: linger
+      linger: linger,
+      tx_payload: tx_payload
     }
 
     pid = spawn_link(fn -> accept(listen, script) end)
@@ -94,7 +99,16 @@ defmodule Athanor.P2P.FakePeerServer do
     progress
   end
 
-  # Anything else (protoconf, getaddr, duplicate version/verack) is ignored.
+  # Answer a `getdata` with the configured raw tx (T3.4). The observer requests
+  # the tx it was inv'd; we serve the bytes whose hash the client will verify.
+  defp react(%Frame{command: "getdata"}, sock, progress, %{tx_payload: payload} = script)
+       when is_binary(payload) do
+    send_frame(sock, script.network, :tx, payload)
+    progress
+  end
+
+  # Anything else (protoconf, getaddr, duplicate version/verack, or a getdata
+  # with no tx configured) is ignored.
   defp react(%Frame{}, _sock, progress, _script), do: progress
 
   defp send_frame(sock, network, command, payload) do
