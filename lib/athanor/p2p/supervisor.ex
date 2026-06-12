@@ -2,19 +2,21 @@ defmodule Athanor.P2P.Supervisor do
   @moduledoc """
   Supervises the P2P peer pool (Phase 2, T2.5).
 
-  Owns four children under `:rest_for_one`:
+  Owns five children under `:rest_for_one`:
 
     1. `Athanor.P2P.PeerRegistry` (the live-peer view), then
     2. `Athanor.P2P.MempoolObserver` (Phase 3 §C — inbound mempool ingest), then
     3. `Athanor.P2P.TxRelay` (Phase 4 §A — outbound broadcast + relay-back), then
-    4. `Athanor.P2P.PeerPool` (the dialer), with `frame_sink` set to the
-       **fan-out list** `[MempoolObserver, TxRelay]` so each forwarded frame
-       reaches both consumers (the observer cares about `inv`/`tx`/`notfound`;
-       the relay about `getdata`/`inv`/`reject`).
+    4. `Athanor.P2P.TxFetcher` (Phase 5 §B — `getdata` pull-fetch by txid), then
+    5. `Athanor.P2P.PeerPool` (the dialer), with `frame_sink` set to the
+       **fan-out list** `[MempoolObserver, TxRelay, TxFetcher]` so each forwarded
+       frame reaches every consumer (the observer cares about `inv`/`tx`/
+       `notfound`; the relay about `getdata`/`inv`/`reject`; the fetcher about
+       `tx`/`notfound` for txids it is actively pulling).
 
-  `:rest_for_one` is deliberate and ordered: both sink names must be registered
+  `:rest_for_one` is deliberate and ordered: every sink name must be registered
   before the pool forwards frames to them; a registry restart cascades to all;
-  a pool crash leaves the registry, observer, and relay intact.
+  a pool crash leaves the registry, observer, relay, and fetcher intact.
 
   This supervisor is **config-gated and off by default** (per the plan, P2P is
   disabled until soak-tested). It runs as a *sibling* of the existing runtime
@@ -27,13 +29,22 @@ defmodule Athanor.P2P.Supervisor do
   use Supervisor
   require Logger
 
-  alias Athanor.P2P.{MempoolObserver, Network, PeerPool, PeerRegistry, TxRelay, Watchlist}
+  alias Athanor.P2P.{
+    MempoolObserver,
+    Network,
+    PeerPool,
+    PeerRegistry,
+    TxFetcher,
+    TxRelay,
+    Watchlist
+  }
+
   alias Athanor.P2P.Messages.Version
   alias Athanor.Services.Broadcast
 
-  # The pool's frame_sink fan-out (§A): every post-handshake frame reaches both
-  # the inbound observer and the outbound relay.
-  @frame_sinks [MempoolObserver, TxRelay]
+  # The pool's frame_sink fan-out (§A): every post-handshake frame reaches the
+  # inbound observer, the outbound relay, and the pull-fetcher (Phase 5).
+  @frame_sinks [MempoolObserver, TxRelay, TxFetcher]
 
   # Application-env key for the P2P stack: `config :athanor, Athanor.P2P, ...`.
   @config_key Athanor.P2P
@@ -66,13 +77,19 @@ defmodule Athanor.P2P.Supervisor do
       |> Keyword.get(:relay_opts, default_relay_opts())
       |> Keyword.put_new(:name, TxRelay)
 
-    # `:rest_for_one`, ordered Registry → Observer → TxRelay → Pool: both sink
-    # names must be registered before the pool starts forwarding frames to them,
-    # and a registry restart cascades to all.
+    fetcher_opts =
+      opts
+      |> Keyword.get(:fetcher_opts, [])
+      |> Keyword.put_new(:name, TxFetcher)
+
+    # `:rest_for_one`, ordered Registry → Observer → TxRelay → TxFetcher → Pool:
+    # every sink name must be registered before the pool starts forwarding frames
+    # to them, and a registry restart cascades to all.
     children = [
       {PeerRegistry, [name: PeerRegistry]},
       {MempoolObserver, observer_opts},
       {TxRelay, relay_opts},
+      {TxFetcher, fetcher_opts},
       {PeerPool, pool_config}
     ]
 
