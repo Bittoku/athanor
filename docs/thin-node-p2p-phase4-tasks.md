@@ -51,11 +51,15 @@ A pure reducer governs one broadcast's life with no process/IO, mirroring the Ph
 
 **State** (per in-flight broadcast, keyed by txid — wire/internal order, as in Phase 3):
 - `pending` — `%{txid => %{raw: payload, announced_to: MapSet(peer), relayed_back: MapSet(peer),
-  first_at_ms: t}}`. `raw` is served on a matching `getdata`.
+  bar: non_neg_integer, propagated?: boolean, first_at_ms: t}}`. `raw` is served on a matching `getdata`.
+  **`bar` is supplied by the caller** in the `{:broadcast, …, bar}` event (the `TxRelay` computes it from the
+  live-peer count via the hold-back rule — see below) and stored here; it is **not** derivable from
+  `announced_to` alone (1 target ⇒ N=2/bar=1 *or* N=3/bar=2), which is why it is a first-class event field.
 - A broadcast is **propagated** once `relayed_back` contains **≥`bar` distinct peers that were NOT in
-  `announced_to`** (see the hold-back rule below for `bar`) — i.e. peers we didn't tell are now advertising
-  it, proving the network accepted and re-gossiped it. Counting **only non-targets** avoids mistaking our
-  own announce echoing; a relay-back from a peer in `announced_to` is **never** counted.
+  `announced_to`** (and `bar ≥ 1`) — i.e. peers we didn't tell are now advertising it, proving the network
+  accepted and re-gossiped it. Counting **only non-targets** avoids mistaking our own announce echoing; a
+  relay-back from a peer in `announced_to` is **never** counted. `propagated?` makes `:propagated`
+  fire exactly once.
 - `ttl_ms` / `:tick` expiry: a broadcast that never reaches the propagation bar within the window is
   marked `:unconfirmed` and dropped from `pending` (the caller already has the REST/RPC fallback result).
 
@@ -63,9 +67,9 @@ A pure reducer governs one broadcast's life with no process/IO, mirroring the Ph
 
 | Event | Decision | Action(s) |
 |---|---|---|
-| `{:broadcast, txid, raw, targets}` | Record `pending[txid]` with `announced_to = targets` (the `N − held` announce set; the caller/`TxRelay` applies the hold-back rule) and `bar`. | `[{:send_inv, peer, txid} for peer <- targets]` |
+| `{:broadcast, txid, raw, targets, bar}` | Record `pending[txid]` with `announced_to = targets` (the `N − held` announce set the `TxRelay` chose) and `bar = held`. The **normative broadcast event shape** is this 5-tuple. | `[{:send_inv, peer, txid} for peer <- targets]` |
 | `{:getdata, txid, peer}` | If `pending[txid]` → serve the stored raw tx to that peer; else ignore (not ours). | `{:send_tx, peer, raw}` or none |
-| `{:inv, txid, peer}` | If `pending[txid]` **and `peer ∉ announced_to`** → add to `relayed_back`; once `held ≥ 1` and `\|relayed_back\| ≥ bar` → emit `:propagated` once. A `peer ∈ announced_to` (target echo) is ignored. | `{:propagated, txid}` or none |
+| `{:inv, txid, peer}` | If `pending[txid]` **and `peer ∉ announced_to`** → add to `relayed_back`; once `bar ≥ 1` and `\|relayed_back\| ≥ bar` and not already emitted → set `propagated?` and emit `:propagated`. A `peer ∈ announced_to` (target echo) is ignored. | `{:propagated, txid}` or none |
 | `{:reject, txid, peer, reason}` | Record the rejection for that txid (surfaced to the broadcast caller/audit). | `{:rejected, txid, peer, reason}` |
 | `:tick` | Drop `pending` entries older than `ttl_ms`, emitting `:unconfirmed` for each. | `[{:unconfirmed, txid}]` |
 
@@ -85,16 +89,21 @@ A pure reducer governs one broadcast's life with no process/IO, mirroring the Ph
   `announced_to`**, and `held ≥ 1` guarantees such a peer can exist before we ever claim propagation.
 - **Idempotent propagation:** `:propagated` fires exactly once per txid (track an emitted flag).
 
-**Tests (T4.0).** Each row as a unit case over the pure reducer (inject `now_ms`), asserting target vs
-non-target membership **explicitly** so a target echo can never satisfy the bar:
-- announce → `:send_inv` to exactly the `N − held` targets;
+**Tests (T4.0).** Each row as a unit case over the pure reducer (inject `now_ms`), asserting the **normative
+`{:broadcast, txid, raw, targets, bar}` 5-tuple** and target vs non-target membership **explicitly** so a
+target echo can never satisfy the bar:
+- `{:broadcast, …, bar}` records `pending[txid]` with `announced_to = targets`, the stored `bar`, and
+  `propagated? = false`;
+- announce → `:send_inv` to exactly the `targets`;
 - `getdata` serves only a pending (ours) txid, never a stranger's;
 - a relay-back from a peer **in** `announced_to` does **not** count; from a held-back peer it does;
 - **N ≥ 3 (`bar = 2`)**: `:propagated` fires once, only at the 2nd distinct *held-back* relay-back (a
   target echo + one held-back relay-back is **not** enough);
 - **N == 2 (`bar = 1`)**: `:propagated` fires at the 1st held-back relay-back;
-- **N == 1 (`held = 0`)**: no relay-back can count → never `:propagated`; the tick expires it to
+- **N == 1 (`held = 0`/`bar = 0`)**: no relay-back can count → never `:propagated`; the tick expires it to
   `:unconfirmed`;
+- **once-only**: a repeat `inv` from an already-counted held-back peer (or any further `inv` after the
+  threshold) does **not** re-emit `:propagated` (`propagated?` guards it);
 - `reject` recorded; tick expires stale pending as `:unconfirmed`.
 
 ---
@@ -103,15 +112,37 @@ non-target membership **explicitly** so a target echo can never satisfy the bar:
 
 `broadcast_tx/2` keeps its audit-row + return shape. The broadcast path becomes **P2P-primary, REST/RPC
 fallback**, behind an injected seam so tests need no node:
-- New optional opt `:relay` — `(txid, raw -> :ok)` (default: cast to the supervised `TxRelay`). When P2P is
+- New optional opt `:relay` — **`(raw -> :ok)`** (default: cast to the supervised `TxRelay`). When P2P is
   enabled and ≥1 live peer exists, announce via the relay and mark the audit row `status: "relayed"`; the
   RPC/REST `broadcaster` still runs as the **belt-and-suspenders fallback** (BSV nodes dedupe a tx they
   already saw via P2P, so double-submit is safe) **unless** config opts out.
 - When P2P is disabled or there are **zero** live peers (cold start), behavior is **exactly today's** —
   RPC/REST only. This is the cold-start-safety rule carried from DXS; it is the headline T4.2 test.
-- Propagation is asynchronous: `broadcast_tx` returns after recording + handing off; `:propagated` /
-  `:unconfirmed` / `:rejected` update the audit row out of band (a `Broadcast.status` transition:
-  `pending → relayed → propagated | unconfirmed`, and `rejected` on a `reject`).
+
+**txid is derived from `raw`, never trusted from the caller (blocker — outbound consistency).** The
+`TxRelay` computes `txid = SHA256d(raw)` itself and uses *that* both as the `inv` it announces and as the
+`pending` key it serves `getdata` from — so the announced txid and the served bytes are consistent by
+construction (no "announce X, serve Y" class of bug). `broadcast_tx/2` already parses `raw` to derive the
+audit txid; that derived value is the single source of truth. If `raw` does not parse as a transaction, it
+is **not** announced or enqueued: the audit row is written `status: "rejected"` with an explicit
+`error: "invalid raw transaction"`, and the RPC fallback is not attempted. The relay/tracker therefore
+never receive a separately-supplied txid that could disagree with `raw`.
+
+**Audit status model (single `status` string column; widen `Broadcast.changeset`, no PG-enum so no
+migration — confirm in T4.2).** Statuses and the **monotonic, never-downgrading** precedence
+`pending(0) < relayed(1) < accepted(2) < propagated(3)`:
+- `pending` — row created.
+- `relayed` — announced to ≥1 peer via P2P.
+- `accepted` — the RPC/REST fallback returned ok (authoritative *single-node* acceptance). Coexists with
+  the P2P axis as a strictly-higher tier than `relayed`: a tx that is `relayed` then RPC-`accepted` ends
+  `accepted` unless it also reaches `propagated`.
+- `propagated` — ≥`bar` distinct non-target peers re-announced it (network-level acceptance; the ceiling).
+- `unconfirmed` — set **only** by the TTL tick on a row still `< accepted` (neither node-accepted nor
+  propagated); it never overrides `accepted`/`propagated`.
+- `rejected` — a node/peer refusal (RPC error, or a P2P `reject`) on a row still `< accepted`.
+Cold-start (no P2P) collapses to exactly today's `pending → accepted | rejected`. Propagation is
+asynchronous: `broadcast_tx/2` returns after recording + handing off; `:propagated`/`:unconfirmed`/
+`:rejected` update the row out of band under this precedence (a transition never lowers the tier).
 
 **`matches?`-style single authority:** there is one broadcast entry point (`broadcast_tx/2`); P2P vs RPC is a
 *routing* decision inside it, not a second public API.
@@ -134,20 +165,34 @@ fallback**, behind an injected seam so tests need no node:
 ### T4.1 — `TxRelay` GenServer — `Athanor.P2P.TxRelay`
 The thin shell: registered `frame_sink` member; on `{:peer,_,:frame,%Frame{command:"getdata"|"inv"|"reject"}}`
 folds `Tracker.step` and performs `{:send_tx,_}`/`{:send_inv,_}`/`{:propagated,_}` via `Peer.send_frame` and
-audit callbacks; `broadcast(txid, raw)` reads `PeerRegistry.pids/1`, applies the §B hold-back rule
-(announce to `N − min(2, N−1)`, `bar = min(2, N−1)`), and steps `{:broadcast, txid, raw, targets, bar}`;
+audit callbacks; `broadcast(raw)` **derives `txid = SHA256d(raw)`** (single source of truth — never a
+caller-supplied txid), reads `PeerRegistry.pids/1`, applies the §B hold-back rule (announce to
+`N − min(2, N−1)`, `bar = min(2, N−1)`), and steps `{:broadcast, txid, raw, targets, bar}`. Unparseable
+`raw` is **not** enqueued or announced — it returns a deterministic error for the caller's audit path.
 `:tick`/TTL timers injected.
-**RED:** `tx_relay_test.exs` (fake peers + stub audit sink): broadcast → `send_inv` to the `N − held`
-announce targets captured;
-`getdata` for a pending txid → `send_tx` with the stored bytes; `bar` distinct held-back `inv`s → `:propagated` audit;
-`reject` → audit; non-pending `getdata` ignored.
+**RED:** `tx_relay_test.exs` (fake peers + stub audit sink): `broadcast(raw)` → `send_inv` carrying the
+**derived** txid to the `N − held` announce targets captured; an **unparseable `raw`** → no `send_inv`,
+deterministic error; `getdata` for a pending txid → `send_tx` with the exact stored bytes (which hash to the
+announced txid); `bar` distinct held-back `inv`s → `:propagated` audit; `reject` → audit; non-pending
+`getdata` ignored.
 **GREEN/REFACTOR:** as above; reuse the Phase-3 `apply_actions` shape.
 
-### T4.2 — Broadcast integration (§C) — `services/broadcast.ex`
-**RED:** `broadcast_test.exs` additions — P2P-enabled + live peers → relay invoked + row `relayed`
-(+ fallback broadcaster still called); **P2P disabled / zero peers → RPC-only, row exactly as today**
-(cold-start safety); a `:propagated` event transitions the row.
-**GREEN:** inject `:relay`; route by `Supervisor.enabled?/0` + `PeerRegistry.pids/1 != []`.
+### T4.2 — Broadcast integration (§C) — `services/broadcast.ex` + `Athanor.Schema.Broadcast`
+**Status-contract work (blocker).** `Broadcast.changeset/2` today validates only `pending|accepted|rejected`
+(`lib/athanor/schema/broadcast.ex`). Widen `validate_inclusion` to add `relayed|propagated|unconfirmed` and
+update the schema moduledoc. `status` is a plain string column (no PG enum), so **no migration is required —
+T4.2 must confirm this** (a `mix ecto` check); add one only if the column is constrained.
+**RED:** `broadcast_test.exs` additions —
+- each new status (`relayed`/`propagated`/`unconfirmed`) **persists through `Broadcast.changeset/2`**;
+- P2P-enabled + live peers → relay invoked + row `relayed` (+ the RPC fallback still called);
+- **P2P disabled / zero peers → RPC-only, row exactly as today** (cold-start safety);
+- **precedence (monotonic, never downgrades):** a `relayed` row that the RPC fallback then accepts ends
+  `accepted`; a later `:propagated` lifts it to `propagated`; a TTL `:unconfirmed` does **not** override an
+  `accepted`/`propagated` row; a `:propagated`/`:unconfirmed`/`:rejected` event applies via the precedence;
+- **invalid `raw`** → row `rejected` with `error: "invalid raw transaction"`, **no** `inv`, **no** RPC call.
+**GREEN:** widen the changeset; inject `:relay`; route by `Supervisor.enabled?/0` + `PeerRegistry.pids/1 != []`;
+apply the status precedence in one place (a `Broadcast.advance_status/2`-style helper) so out-of-band events
+never lower the tier.
 
 ### T4.3 — Integration: self-broadcast round-trips (real socket) — `tx_relay/integration_test.exs` (`async: false`)
 End-to-end over loopback through the real `P2P.Supervisor` with **≥3** `FakePeerServer`s so the hold-back
@@ -175,6 +220,16 @@ tx). `mix test --only external`; mainnet opt-in via `P2P_SMOKE_NETWORK=mainnet`.
 - Cold-start safety: with P2P primary **and zero peers**, `broadcast_tx` still works via RPC/REST fallback,
   byte-for-byte as today.
 - The §A fan-out keeps Phase 2/3 behavior unchanged for single-sink/`nil` configs; one broadcast public API.
+- **Normative event shape:** the reducer and `TxRelay` agree on `{:broadcast, txid, raw, targets, bar}`
+  (`bar` stored in `pending`, not re-derived); T4.0/T4.1 assert it for N≥3, N==2, N==1, and once-only
+  propagation.
+- **Outbound consistency:** `txid` is derived from `raw` (`SHA256d`), used for both the announced `inv` and
+  the served `tx`; unparseable `raw` is rejected (`error: "invalid raw transaction"`) with no `inv` and no
+  RPC call — tested for valid and invalid `raw`.
+- **Audit status contract:** `Broadcast.changeset/2` accepts `pending|relayed|propagated|unconfirmed|
+  accepted|rejected`, all persisting; transitions follow the monotonic precedence
+  `pending<relayed<accepted<propagated` (with `unconfirmed`/`rejected` only below `accepted`); no migration
+  required (string column — confirmed in T4.2).
 - Format clean under Elixir 1.15; app code clean under `mix compile --warnings-as-errors`.
 
 ---
