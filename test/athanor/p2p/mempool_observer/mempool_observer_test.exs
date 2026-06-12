@@ -224,8 +224,9 @@ defmodule Athanor.P2P.MempoolObserverTest do
 
     send(obs, {:peer, peer, :frame, inv_frame(txid)})
     _ = :sys.get_state(obs)
-    # Drive the timeout directly (no sleep) — the same message the timer sends.
-    send(obs, {:request_timeout, txid})
+    # Drive the timeout directly (no sleep) — the same scoped message the timer
+    # sends: txid + the request identity (peer + requested_at, here now_fun=0).
+    send(obs, {:request_timeout, txid, peer, 0})
     _ = :sys.get_state(obs)
     send(obs, {:peer, peer, :frame, tx_frame(payload)})
     _ = :sys.get_state(obs)

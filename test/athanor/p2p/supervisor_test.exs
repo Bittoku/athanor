@@ -1,17 +1,18 @@
 defmodule Athanor.P2P.SupervisorTest do
   @moduledoc """
-  Tests for `Athanor.P2P.Supervisor` (T2.5): the config-gated tree that owns the
-  `PeerRegistry` and `PeerPool`. Verifies child membership, `:rest_for_one`
-  restart semantics (registry restart takes the pool with it, not vice-versa),
-  the `enabled?/0` config gate (default off), and that the app tree excludes the
-  P2P supervisor by default.
+  Tests for `Athanor.P2P.Supervisor` (T2.5 + Phase 3 §C): the config-gated tree
+  that owns the `PeerRegistry`, `MempoolObserver`, and `PeerPool`. Verifies child
+  membership, `:rest_for_one` restart semantics (registry restart takes the pool
+  with it, not vice-versa), the `enabled?/0` config gate (default off), that the
+  app tree excludes the P2P supervisor by default, and that the observer is
+  wired as the pool's `frame_sink` so forwarded frames reach it (blocker 1).
 
   `async: false` (singleton `PeerRegistry` name + global app env).
   """
   use ExUnit.Case, async: false
 
-  alias Athanor.P2P.{Network, PeerPool, PeerRegistry}
-  alias Athanor.P2P.Messages.Version
+  alias Athanor.P2P.{Frame, MempoolObserver, Network, PeerPool, PeerRegistry, Watchlist}
+  alias Athanor.P2P.Messages.{Inv, Version}
 
   defp ver do
     na = Version.net_addr(0, <<0::128>>, 0)
@@ -102,5 +103,52 @@ defmodule Athanor.P2P.SupervisorTest do
     cfg = Athanor.P2P.Supervisor.runtime_pool_config()
     assert %PeerPool.Config{network: %Network{}, our_version: %Version{}} = cfg
     assert cfg.target > 0
+  end
+
+  ## ── Phase 3: observer wiring (the !12 review's blocker 1) ──
+
+  test "starts the MempoolObserver under the tree, registered under its name" do
+    sup =
+      start_supervised!(
+        {Athanor.P2P.Supervisor,
+         pool_config: fake_config(), observer_opts: [watchlist: Watchlist.new()]}
+      )
+
+    ids = Supervisor.which_children(sup) |> Enum.map(&elem(&1, 0))
+    assert MempoolObserver in ids
+    assert is_pid(Process.whereis(MempoolObserver))
+  end
+
+  test "routes a pool frame to the observer, which requests the tx (frame_sink wiring)" do
+    sup =
+      start_supervised!(
+        {Athanor.P2P.Supervisor,
+         pool_config: fake_config(), observer_opts: [watchlist: Watchlist.new()]}
+      )
+
+    # Drive an inv into the pool as if a Peer forwarded it. The pool forwards it
+    # to its frame_sink (the observer), which issues a getdata back to the
+    # advertising peer — here self(), so the cast lands as a message to us.
+    txid = :binary.copy(<<0xEE>>, 32)
+    inv = %Frame{command: "inv", payload: Inv.serialize([{:tx, txid}])}
+    send(child_pid(sup, PeerPool), {:peer, self(), :frame, inv})
+
+    assert_receive {:"$gen_cast", {:send_frame, :getdata, payload}}, 1_000
+    assert payload == Inv.serialize([{:tx, txid}])
+  end
+
+  test "runtime_pool_config wires the observer name as the frame_sink" do
+    assert Athanor.P2P.Supervisor.runtime_pool_config().frame_sink == MempoolObserver
+  end
+
+  test "an explicit frame_sink in the pool_config is preserved" do
+    config = %{fake_config() | frame_sink: self()}
+
+    sup =
+      start_supervised!(
+        {Athanor.P2P.Supervisor, pool_config: config, observer_opts: [watchlist: Watchlist.new()]}
+      )
+
+    assert :sys.get_state(child_pid(sup, PeerPool)).config.frame_sink == self()
   end
 end

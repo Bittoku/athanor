@@ -99,7 +99,11 @@ defmodule Athanor.P2P.MempoolObserver do
         {tracker, acc ++ new_actions}
       end)
 
-    state = Enum.reduce(actions, %{state | tracker: tracker}, &apply_action/2)
+    state =
+      Enum.reduce(actions, %{state | tracker: tracker}, fn action, st ->
+        apply_action(action, now, st)
+      end)
+
     {:noreply, state}
   end
 
@@ -142,8 +146,10 @@ defmodule Athanor.P2P.MempoolObserver do
     {:noreply, %{state | tracker: tracker}}
   end
 
-  def handle_info({:request_timeout, txid}, state) do
-    {tracker, _} = Tracker.step(state.tracker, {:timeout, txid}, state.now_fun.())
+  def handle_info({:request_timeout, txid, peer, requested_at}, state) do
+    {tracker, _} =
+      Tracker.step(state.tracker, {:timeout, txid, peer, requested_at}, state.now_fun.())
+
     {:noreply, %{state | tracker: tracker}}
   end
 
@@ -163,13 +169,21 @@ defmodule Athanor.P2P.MempoolObserver do
   # `:ingest` action is handled inline in the `tx` clause (it needs the parsed
   # tx). A `:getdata` writes the request to the advertising peer, arms a
   # per-request timeout, and monitors the peer for `:peer_down`.
-  defp apply_action({:getdata, peer, txid}, state) do
+  defp apply_action({:getdata, peer, txid}, requested_at, state) do
     Peer.send_frame(peer, :getdata, Inv.serialize([{:tx, txid}]))
-    Process.send_after(self(), {:request_timeout, txid}, state.request_timeout_ms)
+    # Scope the timer to this request generation: `requested_at` is the same
+    # `now` the Tracker stored as the outstanding identity, so a stale timer
+    # cannot clear a newer request for the same txid (review blocker 2).
+    Process.send_after(
+      self(),
+      {:request_timeout, txid, peer, requested_at},
+      state.request_timeout_ms
+    )
+
     monitor_peer(peer, state)
   end
 
-  defp apply_action(_action, state), do: state
+  defp apply_action(_action, _requested_at, state), do: state
 
   defp monitor_peer(peer, %{monitors: monitors} = state) do
     if Map.has_key?(monitors, peer) do

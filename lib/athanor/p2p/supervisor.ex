@@ -2,13 +2,16 @@ defmodule Athanor.P2P.Supervisor do
   @moduledoc """
   Supervises the P2P peer pool (Phase 2, T2.5).
 
-  Owns two children under `:rest_for_one`:
+  Owns three children under `:rest_for_one`:
 
     1. `Athanor.P2P.PeerRegistry` (the live-peer view), then
-    2. `Athanor.P2P.PeerPool` (the dialer).
+    2. `Athanor.P2P.MempoolObserver` (Phase 3 §C — the pool's `frame_sink`), then
+    3. `Athanor.P2P.PeerPool` (the dialer), with `frame_sink` set to the
+       observer's registered name so forwarded frames reach it.
 
-  `:rest_for_one` is deliberate: if the registry dies the pool must restart too
-  (it holds registry state), but a pool crash leaves the registry intact.
+  `:rest_for_one` is deliberate and ordered: the observer's name must be
+  registered before the pool forwards frames to it; a registry restart cascades
+  to both; a pool crash leaves the registry and observer intact.
 
   This supervisor is **config-gated and off by default** (per the plan, P2P is
   disabled until soak-tested). It runs as a *sibling* of the existing runtime
@@ -19,8 +22,9 @@ defmodule Athanor.P2P.Supervisor do
   """
 
   use Supervisor
+  require Logger
 
-  alias Athanor.P2P.{Network, PeerPool, PeerRegistry}
+  alias Athanor.P2P.{MempoolObserver, Network, PeerPool, PeerRegistry, Watchlist}
   alias Athanor.P2P.Messages.Version
 
   # Application-env key for the P2P stack: `config :athanor, Athanor.P2P, ...`.
@@ -39,8 +43,22 @@ defmodule Athanor.P2P.Supervisor do
   def init(opts) do
     pool_config = Keyword.get(opts, :pool_config) || runtime_pool_config()
 
+    # The observer is the pool's frame sink (§C). Default the sink to the
+    # observer's registered name (so the wiring survives an observer restart),
+    # while honouring an explicitly-supplied sink.
+    pool_config = %{pool_config | frame_sink: pool_config.frame_sink || MempoolObserver}
+
+    observer_opts =
+      opts
+      |> Keyword.get(:observer_opts, default_observer_opts())
+      |> Keyword.put_new(:name, MempoolObserver)
+
+    # `:rest_for_one`, ordered Registry → Observer → Pool: the observer's name
+    # must be registered before the pool starts forwarding frames to it, and a
+    # registry restart cascades to both.
     children = [
       {PeerRegistry, [name: PeerRegistry]},
+      {MempoolObserver, observer_opts},
       {PeerPool, pool_config}
     ]
 
@@ -64,8 +82,32 @@ defmodule Athanor.P2P.Supervisor do
     %PeerPool.Config{
       network: network,
       target: Keyword.get(env, :target, 8),
-      our_version: default_version()
+      our_version: default_version(),
+      frame_sink: MempoolObserver
     }
+  end
+
+  # Observer options for the supervised child. The prefilter watchlist is seeded
+  # from the persisted `WatchingAddress` set; the matcher (`matches?/1`) and the
+  # indexing pipeline use their production defaults.
+  defp default_observer_opts, do: [watchlist: build_watchlist()]
+
+  # Seed a `Watchlist` from the watched-address table. Wrapped defensively: a
+  # transient DB unavailability at P2P start (P2P is enabled post-boot) must not
+  # crash the supervisor — it starts with an empty prefilter and is repopulated
+  # on the next restart rather than taking the tree down.
+  defp build_watchlist do
+    table = Watchlist.new()
+
+    try do
+      Athanor.Repo.all(Athanor.Schema.WatchingAddress)
+      |> Enum.each(fn %{address: address} -> Watchlist.put_address(table, address) end)
+    rescue
+      error ->
+        Logger.debug("P2P watchlist seed skipped (#{inspect(error)}); starting empty")
+    end
+
+    table
   end
 
   defp default_version do

@@ -65,10 +65,27 @@ defmodule Athanor.P2P.MempoolObserver.TrackerTest do
       assert {_s, [{:getdata, :peerB, _}]} = Tracker.step(state, {:inv, txid(1), :peerB}, 2)
     end
 
-    test "a per-request timeout clears the request" do
+    test "a per-request timeout (matching the outstanding generation) clears the request" do
+      # The inv at now=0 stores outstanding {peerA, 0}; the timeout carries that
+      # same identity (peer + requested_at).
       {state, _} = Tracker.step(new(), {:inv, txid(1), :peerA}, 0)
-      {state, []} = Tracker.step(state, {:timeout, txid(1)}, 100)
+      {state, []} = Tracker.step(state, {:timeout, txid(1), :peerA, 0}, 100)
       assert {_s, [{:getdata, :peerB, _}]} = Tracker.step(state, {:inv, txid(1), :peerB}, 101)
+    end
+
+    test "a stale timeout (wrong generation) does NOT erase a newer request (blocker 2)" do
+      # peerA advertises (outstanding {peerA, 10}); notfound clears it; peerB
+      # re-advertises (outstanding {peerB, 12}). peerA's stale timer fires with
+      # the OLD identity {peerA, 10} — it must not touch peerB's request.
+      {state, _} = Tracker.step(new(), {:inv, txid(1), :peerA}, 10)
+      {state, []} = Tracker.step(state, {:notfound, txid(1), :peerA}, 11)
+      {state, [{:getdata, :peerB, _}]} = Tracker.step(state, {:inv, txid(1), :peerB}, 12)
+
+      {state, []} = Tracker.step(state, {:timeout, txid(1), :peerA, 10}, 13)
+
+      # peerB's request survived → its tx still ingests.
+      {_state, ingest} = Tracker.step(state, {:tx, txid(1), "raw-B", :peerB}, 14)
+      assert ingest == [{:ingest, "raw-B"}]
     end
 
     test "peer-down clears only that peer's outstanding requests" do
