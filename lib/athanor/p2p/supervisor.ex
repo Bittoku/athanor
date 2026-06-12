@@ -141,6 +141,12 @@ defmodule Athanor.P2P.Supervisor do
     rescue
       error ->
         Logger.debug("P2P watchlist seed skipped (#{inspect(error)}); starting empty")
+    catch
+      # A DB-pool checkout failure surfaces as an `exit`, not a raise (e.g. the
+      # connection owner went away). The supervisor must still start with an empty
+      # prefilter rather than crash — same defensive intent as the rescue above.
+      :exit, reason ->
+        Logger.debug("P2P watchlist seed skipped (exit #{inspect(reason)}); starting empty")
     end
 
     table
