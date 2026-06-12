@@ -51,8 +51,10 @@ A pure reducer governs one broadcast's life with no process/IO, mirroring the Ph
 
 **State** (per in-flight broadcast, keyed by txid — wire/internal order, as in Phase 3):
 - `pending` — `%{txid => %{raw: raw_bin, announced_to: MapSet(peer), relayed_back: MapSet(peer),
-  bar: non_neg_integer, propagated?: boolean, first_at_ms: t}}`. `raw_bin` is the **decoded binary tx bytes**
-  (not the ASCII-hex string), served verbatim on a matching `getdata`.
+  served_to: MapSet(peer), bar: non_neg_integer, propagated?: boolean, first_at_ms: t}}`. `raw_bin` is the
+  **decoded binary tx bytes** (not the ASCII-hex string), served verbatim on a matching `getdata`.
+  `served_to` records which peers we've already served this tx to (per-`(txid, peer)` `getdata` dedup — see
+  Bounded resources). The map size is capped at `max_pending` (see below).
   **`bar` is supplied by the caller** in the `{:broadcast, …, bar}` event (the `TxRelay` computes it from the
   live-peer count via the hold-back rule — see below) and stored here; it is **not** derivable from
   `announced_to` alone (1 target ⇒ N=2/bar=1 *or* N=3/bar=2), which is why it is a first-class event field.
@@ -68,8 +70,8 @@ A pure reducer governs one broadcast's life with no process/IO, mirroring the Ph
 
 | Event | Decision | Action(s) |
 |---|---|---|
-| `{:broadcast, txid, raw_bin, targets, bar}` | Record `pending[txid]` with `announced_to = targets` (the `N − held` announce set the `TxRelay` chose) and `bar = held`. The **normative broadcast event shape** is this 5-tuple. | `[{:send_inv, peer, txid} for peer <- targets]` |
-| `{:getdata, txid, peer}` | If `pending[txid]` → serve the stored raw tx to that peer; else ignore (not ours). | `{:send_tx, peer, raw}` or none |
+| `{:broadcast, txid, raw_bin, targets, bar}` | If `\|pending\| ≥ max_pending` → **drop** (emit `:saturated` so the caller audits `rejected`); else record `pending[txid]` with `announced_to = targets` (the `N − held` set the `TxRelay` chose), `bar = held`, `served_to = ∅`. Normative 5-tuple shape. | `[{:send_inv, peer, txid} for peer <- targets]` or `[{:saturated, txid}]` |
+| `{:getdata, txid, peer}` | If `pending[txid]` **and `peer ∉ served_to`** → serve the stored raw tx and add `peer` to `served_to`; a repeat `getdata` from the same peer for the same txid, or a non-pending txid, → ignore (per-`(txid, peer)` dedup). | `{:send_tx, peer, raw}` or none |
 | `{:inv, txid, peer}` | If `pending[txid]` **and `peer ∉ announced_to`** → add to `relayed_back`; once `bar ≥ 1` and `\|relayed_back\| ≥ bar` and not already emitted → set `propagated?` and emit `:propagated`. A `peer ∈ announced_to` (target echo) is ignored. | `{:propagated, txid}` or none |
 | `{:reject, txid, peer, reason}` | Record the rejection for that txid (surfaced to the broadcast caller/audit). | `{:rejected, txid, peer, reason}` |
 | `:tick` | Drop `pending` entries older than `ttl_ms`, emitting `:unconfirmed` for each. | `[{:unconfirmed, txid}]` |
@@ -93,6 +95,24 @@ A pure reducer governs one broadcast's life with no process/IO, mirroring the Ph
   This keeps the core invariant in every mode: **a relay-back counts only if its peer is not in
   `announced_to`**, and `held ≥ 1` guarantees such a peer can exist before we ever claim propagation.
 - **Idempotent propagation:** `:propagated` fires exactly once per txid (track an emitted flag).
+- **Bounded resources (blocker — a network-facing relay must not grow unbounded).** Mirroring the Phase-3
+  observer's flood controls:
+  - `max_pending` (default 256) caps concurrent in-flight broadcasts; over the cap, a new `{:broadcast}` is
+    dropped with `:saturated` → the caller audits `rejected` (`error: "relay saturated"`). This also bounds
+    retained raw bytes to `max_pending × max_tx_bytes`.
+  - **per-`(txid, peer)` `getdata` dedup** via `served_to`: we serve a given pending tx to a given peer **at
+    most once**; repeat `getdata` from a hostile/looping peer is ignored (no repeated `send_tx` work).
+  - **malformed/oversized inventories**: `inv`/`getdata` bodies are parsed with the Phase-3 `Inv.parse`
+    `max_items` guard (`@max_inv_items`); a body exceeding it, or that fails to parse, is dropped — no
+    unbounded parse work on unsolicited frames.
+  These are configurable (`config :athanor, Athanor.P2P, relay: [max_pending: …]`) and unit-tested in
+  T4.0/T4.1 (cap enforcement, `served_to` dedup, oversized-inv drop, no unbounded `pending` growth).
+- **Target selection (blocker — fairness / no origin fingerprint).** Announce targets and held-back peers
+  are chosen through an injected **`:selector`** seam — `select(pids, held) -> {targets, held_back}` — **not**
+  by `Enum.take/2` over incidental `PeerRegistry.pids/1` (map) order. Production default **randomly shuffles**
+  (`:rand`-based) so the announce/hold-back split varies per broadcast and does not leak a stable per-node
+  origin pattern; tests inject a **deterministic** selector. T4.1/T4.3 assert selection goes through the seam
+  (not registry order). Goal stated explicitly: target selection must not be a stable per-node fingerprint.
 
 **Tests (T4.0).** Each row as a unit case over the pure reducer (inject `now_ms`), asserting the **normative
 `{:broadcast, txid, raw_bin, targets, bar}` 5-tuple** and target vs non-target membership **explicitly** so a
@@ -109,7 +129,10 @@ target echo can never satisfy the bar:
   `:unconfirmed`;
 - **once-only**: a repeat `inv` from an already-counted non-target peer (or any further `inv` after the
   threshold) does **not** re-emit `:propagated` (`propagated?` guards it);
-- `reject` recorded; tick expires stale pending as `:unconfirmed`.
+- `reject` recorded; tick expires stale pending as `:unconfirmed`;
+- **bounded resources:** at `max_pending`, a further `{:broadcast}` is dropped with `:saturated` (no
+  `pending` growth); a repeat `getdata` from an already-served `(txid, peer)` yields **no** second `send_tx`;
+  an oversized/malformed `inv`/`getdata` body is dropped.
 
 ---
 
@@ -208,15 +231,17 @@ The thin shell: registered `frame_sink` member; on `{:peer,_,:frame,%Frame{comma
 folds `Tracker.step` and performs `{:send_tx,_}`/`{:send_inv,_}`/`{:propagated,_}` via `Peer.send_frame` and
 audit callbacks; `broadcast(txid, raw_bin)` receives the **already-validated decoded binary tx bytes** and
 the derived `txid` from `broadcast_tx/2` (validation is upstream — §C; the relay is fire-and-forget and never
-returns a parse error), reads `PeerRegistry.pids/1`, applies the §B hold-back rule (announce to
-`N − min(2, N−1)`, `bar = min(2, N−1)`), and steps `{:broadcast, txid, raw_bin, targets, bar}`.
-`:tick`/TTL timers injected.
+returns a parse error), reads `PeerRegistry.pids/1`, picks the announce/hold-back split through the injected
+**`:selector`** seam (§B — default random shuffle; deterministic in tests; `bar = min(2, N−1)`), and steps
+`{:broadcast, txid, raw_bin, targets, bar}`. `:tick`/TTL and the `:max_pending`/`:selector` opts injected.
 **RED:** `tx_relay_test.exs` (fake peers + stub audit sink): `broadcast(txid, raw_bin)` → `send_inv`
-carrying `{:tx, txid}` to the `N − held` announce targets captured; `getdata` for a pending txid → `send_tx`
-with the **exact binary bytes** `raw_bin` (which hash to the announced txid — assert it is the wire bytes,
-not an ASCII-hex string); a relay-back from **any** peer ∉ `announced_to` counts toward `bar` while a
-peer ∈ `announced_to` (target echo) does not; `bar` distinct non-target `inv`s → `:propagated` audit;
-`reject` → audit; non-pending `getdata` ignored.
+carrying `{:tx, txid}` to the targets the **`:selector`** chose (assert selection goes through the seam, not
+`PeerRegistry.pids/1` order); `getdata` for a pending txid → `send_tx` with the **exact binary bytes**
+`raw_bin` (which hash to the announced txid — assert wire bytes, not ASCII hex); a relay-back from **any**
+peer ∉ `announced_to` counts toward `bar` while a peer ∈ `announced_to` (target echo) does not; `bar`
+distinct non-target `inv`s → `:propagated` audit; `reject` → audit; non-pending `getdata` ignored; **bounded
+resources** — `max_pending` saturation drops with `:saturated`, a repeat `getdata` from an already-served
+`(txid, peer)` is **not** re-served, an oversized `inv` body is dropped.
 **GREEN/REFACTOR:** as above; reuse the Phase-3 `apply_actions` shape.
 
 ### T4.2 — Broadcast integration (§C) — `services/broadcast.ex` + `Athanor.Schema.Broadcast`
@@ -300,6 +325,12 @@ tx). `mix test --only external`; mainnet opt-in via `P2P_SMOKE_NETWORK=mainnet`.
   (reject-then-TTL keeps `rejected`; TTL-then-reject becomes `rejected`); no migration (string column —
   confirmed in T4.2). The audit row's `txid` stays display-order hex; binary relay events are converted via
   `display_hex/1` before row lookup, so they update the exact `broadcast_tx/2` row (asserted).
+- **Bounded resources:** `TxRelay` enforces `max_pending` (default 256; over-cap `{:broadcast}` → `:saturated`
+  → audit `rejected`), per-`(txid, peer)` `getdata` dedup via `served_to`, and the `Inv.parse` `max_items`
+  guard on `inv`/`getdata`; T4.0/T4.1 prove the caps and no unbounded `pending` growth.
+- **Target selection:** the announce/hold-back split goes through an injected `:selector` (random shuffle in
+  prod — no stable origin fingerprint; deterministic in tests); T4.1/T4.3 assert selection uses the seam, not
+  `PeerRegistry.pids/1` order.
 - Format clean under Elixir 1.15; app code clean under `mix compile --warnings-as-errors`.
 
 ---
