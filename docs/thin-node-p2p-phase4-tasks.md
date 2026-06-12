@@ -135,9 +135,10 @@ target echo can never satisfy the bar:
 - **once-only**: a repeat `inv` from an already-counted non-target peer (or any further `inv` after the
   threshold) does **not** re-emit `:propagated` (`propagated?` guards it);
 - `reject` recorded; tick expires stale pending as `:unconfirmed`;
-- **bounded resources:** at `max_pending`, a further `{:broadcast}` is dropped with `:saturated` (no
-  `pending` growth); a repeat `getdata` from an already-served `(txid, peer)` yields **no** second `send_tx`;
-  an oversized/malformed `inv`/`getdata` body is dropped.
+- **bounded resources (reducer-scope only):** at `max_pending`, a further `{:broadcast}` is signalled
+  `:saturated` (no `pending` growth); a repeat `getdata` from an already-served `(txid, peer)` yields **no**
+  second `send_tx`. (Malformed/oversized **frame-body** parsing is the shell's job — tested in T4.1, not
+  here; the reducer only ever sees already-decoded logical events.)
 
 ---
 
@@ -149,11 +150,11 @@ seam today. Phase 4 changes it to **`broadcast_tx(raw_tx_hex, opts \\ [])`** —
 second arg, so the **two existing arity-1 callers keep working unchanged** (T4.2 asserts this) and the
 audit-row + return shape are preserved. The new `opts` carry the test/runtime seams (both **new** in Phase 4;
 neither exists on `main`):
-- `:relay` — a **synchronous enqueue** seam `(txid, raw_bin -> :ok | {:error, :saturated})` (default: a
-  `GenServer.call` to the supervised `TxRelay` that runs the capacity check + records `pending` and returns;
-  the `inv`/`getdata`/`tx` frame sends + lifecycle stay async inside `TxRelay`). The call is synchronous
-  **only** so the saturation verdict is available to `broadcast_tx/2` immediately (see saturation handling
-  below); it does not wait on propagation;
+- `:relay` — a **synchronous enqueue** seam `(txid, raw_bin -> :ok | {:error, :saturated} | {:error,
+  :no_peers})` (default: a `GenServer.call` to the supervised `TxRelay` that rechecks the live-peer set, runs
+  the capacity check, records `pending`, and returns; the `inv`/`getdata`/`tx` frame sends + lifecycle stay
+  async inside `TxRelay`). The call is synchronous **only** so the saturated / no-peers verdict is available
+  to `broadcast_tx/2` immediately (see handling below); it does not wait on propagation;
 - `:broadcaster` — `(raw_tx_hex -> {:ok, txid} | {:error, reason})` (default: `&RpcClient.send_raw_transaction/1`,
   i.e. exactly today's direct call), so tests exercise the RPC path without a node;
 - `:rpc_fallback?` — `boolean` (**default `true`**; runtime default also overridable via
@@ -176,20 +177,23 @@ before anything async:
   `relay: [max_tx_bytes: …]`) → row `rejected`, `error: "transaction too large"`, **no relay enqueue, no
   `inv`, no RPC fallback**. Enforced **here, upstream**, so an over-limit tx is never handed to / stored by
   the relay — which is what makes the `max_pending × max_tx_bytes` retained-bytes bound actually hold.
-- The relay `:relay` seam (synchronous enqueue) then either accepts (`:ok`) or reports
-  **`{:error, :saturated}`** when `|pending| ≥ max_pending`. On accept, `TxRelay` announces `inv({:tx, txid})`
-  and serves *those exact binary bytes* on `getdata` — never the ASCII-hex string. The relay never sees
-  invalid/oversized input (rejected above), so the only error it can return is `:saturated`.
+- The relay `:relay` seam (synchronous enqueue) returns `:ok | {:error, :saturated} | {:error, :no_peers}`.
+  `TxRelay.broadcast/2` **rechecks `PeerRegistry.pids/1` itself** and, if it now reads **zero** peers (peer
+  churn between `broadcast_tx/2`'s check and the relay's read), returns `{:error, :no_peers}` **before**
+  computing `held` — so `held = min(2, N−1)` is only ever evaluated for `N ≥ 1` and can never go negative.
+  Otherwise it accepts (`:ok`) or reports `{:error, :saturated}` at `|pending| ≥ max_pending`. On accept,
+  `TxRelay` announces `inv({:tx, txid})` and serves *those exact binary bytes* on `getdata`. The relay never
+  sees invalid/oversized input (rejected above), so its only errors are `:saturated` and `:no_peers`.
 
-- When P2P is enabled and ≥1 live peer exists, call the `:relay` seam:
+- When `broadcast_tx/2`'s own live-peer check sees ≥1 peer, call the `:relay` seam:
   - **`:ok`** (enqueued) → mark the row `status: "relayed"`; the RPC/REST `broadcaster` then runs as the
     **belt-and-suspenders fallback** (BSV nodes dedupe a tx already seen via P2P) **iff `:rpc_fallback?` is
     `true`** (the default); with `:rpc_fallback?: false` it is skipped (T4.3 isolates the propagation proof).
-  - **`{:error, :saturated}`** → the relay declined (at capacity), so P2P can't carry the tx; `broadcast_tx/2`
-    **logs the saturation and falls back to the `:broadcaster` exactly like the cold-start path** (always
-    called, regardless of `:rpc_fallback?`), setting the row to `accepted`/`rejected` per the RPC result. The
-    tx is therefore still broadcast; saturation degrades to RPC-only rather than dropping the tx, and the
-    status reflects the authoritative RPC outcome (never silently `relayed`).
+  - **`{:error, :saturated}`** (capacity) **or `{:error, :no_peers}`** (raced to zero peers) → P2P can't
+    carry the tx, so `broadcast_tx/2` **logs it and falls back to the `:broadcaster` exactly like the
+    cold-start path** (always called, regardless of `:rpc_fallback?`), setting the row to `accepted`/`rejected`
+    per the RPC result. The tx is still broadcast; it degrades to RPC-only rather than dropping or
+    silently-`relayed` — so **cold-start safety holds under peer churn, not just at startup**.
 - When P2P is disabled or there are **zero** live peers (cold start), behavior is **exactly today's** —
   RPC/REST only. This is the cold-start-safety rule carried from DXS; it is the headline T4.2 test.
 
@@ -246,9 +250,12 @@ The thin shell: registered `frame_sink` member; on `{:peer,_,:frame,%Frame{comma
 folds `Tracker.step` and performs `{:send_tx,_}`/`{:send_inv,_}`/`{:propagated,_}` via `Peer.send_frame` and
 audit callbacks; `broadcast(txid, raw_bin)` receives the **already-validated decoded binary tx bytes** and
 the derived `txid` from `broadcast_tx/2` (validation is upstream — §C; the relay is fire-and-forget and never
-returns a parse error), reads `PeerRegistry.pids/1`, picks the announce/hold-back split through the injected
-**`:selector`** seam (§B — default random shuffle; deterministic in tests; `bar = min(2, N−1)`), and steps
-`{:broadcast, txid, raw_bin, targets, bar}`. `:tick`/TTL and the `:max_pending`/`:selector` opts injected.
+returns a parse error), **rechecks `PeerRegistry.pids/1`** and **returns `{:error, :no_peers}` if it now
+reads zero** (peer-churn race) **before** computing `held` (so `held = min(2, N−1)` is never evaluated at
+N=0); otherwise picks the announce/hold-back split through the injected **`:selector`** seam (§B — default
+random shuffle; deterministic in tests; `bar = min(2, N−1)`) and steps `{:broadcast, txid, raw_bin, targets,
+bar}`, returning `:ok` (or `{:error, :saturated}` at the cap). `:tick`/TTL and the
+`:max_pending`/`:selector` opts injected.
 **RED:** `tx_relay_test.exs` (fake peers + stub audit sink): `broadcast(txid, raw_bin)` → `send_inv`
 carrying `{:tx, txid}` to the targets the **`:selector`** chose (assert selection goes through the seam, not
 `PeerRegistry.pids/1` order); `getdata` for a pending txid → `send_tx` with the **exact binary bytes**
@@ -256,7 +263,9 @@ carrying `{:tx, txid}` to the targets the **`:selector`** chose (assert selectio
 peer ∉ `announced_to` counts toward `bar` while a peer ∈ `announced_to` (target echo) does not; `bar`
 distinct non-target `inv`s → `:propagated` audit; `reject` → audit; non-pending `getdata` ignored; **bounded
 resources** — at `max_pending` the synchronous enqueue returns `{:error, :saturated}`, a repeat `getdata` from an already-served
-`(txid, peer)` is **not** re-served, an oversized `inv` body is dropped.
+`(txid, peer)` is **not** re-served, and a malformed/oversized `inv`/`getdata` **frame body** is dropped by
+the shell's `Inv.parse`/`max_items` guard **before** the reducer is called; **no-peers race** — with the
+registry empty at enqueue time, `broadcast(txid, raw_bin)` returns `{:error, :no_peers}` and no `send_inv`.
 **GREEN/REFACTOR:** as above; reuse the Phase-3 `apply_actions` shape.
 
 ### T4.2 — Broadcast integration (§C) — `services/broadcast.ex` + `Athanor.Schema.Broadcast`
@@ -284,9 +293,11 @@ T4.2 must confirm this** (a `mix ecto` check); add one only if the column is con
 - **invalid `raw`** → row `rejected` (`error: "invalid raw transaction"`), **no** `inv`, **no** RPC call;
 - **oversized `raw`** (`> max_tx_bytes`) → row `rejected` (`error: "transaction too large"`), **no** relay,
   **no** `inv`, **no** RPC call (not stored/served);
-- **relay saturated** (`:relay` returns `{:error, :saturated}`) → `broadcast_tx/2` falls back to the
-  `:broadcaster` (always, like cold-start) and the row reflects the RPC result (`accepted`/`rejected`),
-  **not** `relayed`; tested with and without `:rpc_fallback?`.
+- **relay saturated / no peers** (`:relay` returns `{:error, :saturated}` or `{:error, :no_peers}`) →
+  `broadcast_tx/2` falls back to the `:broadcaster` (always, like cold-start) and the row reflects the RPC
+  result (`accepted`/`rejected`), **not** `relayed`. Includes the **peer-churn race**: `broadcast_tx/2`
+  initially sees ≥1 peer but the `:relay` stub returns `{:error, :no_peers}` → RPC fallback still fires
+  (cold-start safety under churn). Tested with and without `:rpc_fallback?`.
 **GREEN:** widen the changeset; inject `:relay`; route by `Supervisor.enabled?/0` + `PeerRegistry.pids/1 != []`;
 apply the status precedence in one place (a `Broadcast.advance_status/2`-style helper) so out-of-band events
 never lower the tier.
@@ -317,8 +328,10 @@ tx). `mix test --only external`; mainnet opt-in via `P2P_SMOKE_NETWORK=mainnet`.
   propagation requires **≥`bar` distinct non-target** relays where `bar = held = min(2, N−1)` (2 normally,
   1 with exactly 2 peers, and **never claimed** with 1 peer — it expires `:unconfirmed`). Tests assert the
   relay-back peer ∉ `announced_to`, so a target echo can never flip the status.
-- Cold-start safety: with P2P primary **and zero peers**, `broadcast_tx` still works via RPC/REST fallback,
-  byte-for-byte as today.
+- Cold-start safety (incl. **peer-churn race**): with P2P primary and zero peers — whether at startup **or**
+  if peers drop to zero between `broadcast_tx/2`'s check and the relay's recheck (`{:error, :no_peers}`) —
+  `broadcast_tx` still broadcasts via the RPC/REST fallback, byte-for-byte as today. `held = min(2, N−1)` is
+  only evaluated for `N ≥ 1` (never negative).
 - The §A fan-out keeps Phase 2/3 behavior unchanged for single-sink/`nil` configs.
 - **One broadcast public API:** `broadcast_tx(raw_tx_hex, opts \\ [])` — the existing arity-1 callers
   (`transaction_controller`, `wallet_channel`) work unchanged (asserted); `:relay`/`:broadcaster` are
@@ -331,7 +344,7 @@ tx). `mix test --only external`; mainnet opt-in via `P2P_SMOKE_NETWORK=mainnet`.
   relay announces `inv({:tx, txid})` and serves `raw_bin` (binary wire bytes, never ASCII hex). Validation is
   upstream: invalid hex/unparseable tx → row `rejected` (`error: "invalid raw transaction"`) with **no** relay,
   **no** `inv`, **no** RPC call — tested for valid and invalid input. The relay seam
-  `(txid, raw_bin -> :ok | {:error, :saturated})` is a synchronous enqueue whose only error is `:saturated`
+  `(txid, raw_bin -> :ok | {:error, :saturated} | {:error, :no_peers})` is a synchronous enqueue whose only errors are `:saturated`/`:no_peers`
   (validation is upstream, so it never sees invalid/oversized input).
 - **Fallback control contract:** `:rpc_fallback?` (default `true`; config `rpc_fallback`) gates the
   *post-relay* belt-and-suspenders `:broadcaster` call only — the cold-start path always calls it. T4.2
