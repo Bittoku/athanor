@@ -83,7 +83,7 @@ defmodule Athanor.P2P.TxFetcher.IntegrationTest do
   defp real_p2p(txid_hex) do
     {:ok, wire} = Base.decode16(txid_hex, case: :mixed)
 
-    case TxFetcher.fetch(wire) do
+    case TxFetcher.fetch(TxFetcher, wire) do
       {:ok, raw} ->
         {:ok, tx, _rest} = BSV.Transaction.from_binary(raw)
         {:ok, tx}

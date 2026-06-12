@@ -74,6 +74,37 @@ defmodule Athanor.Indexer.B2gResolverRoutingTest do
     assert Agent.get(agent, & &1) == [:p2p, :rpc, :junglebus, :whatsonchain]
   end
 
+  test "a P2P provider that EXITS (fetcher down) degrades to the REST cascade, not a crash" do
+    tx = fixture_tx()
+    txid = BSV.Transaction.txid_binary(tx)
+
+    providers = %{
+      # Simulates TxFetcher.fetch exiting (mid supervisor-restart / unregistered).
+      p2p: fn _hex -> exit(:noproc) end,
+      rpc: fn _hex -> {:ok, tx} end,
+      junglebus: fn _hex -> flunk("JungleBus should not be reached (RPC resolves)") end,
+      whatsonchain: fn _hex -> flunk("WhatsOnChain should not be reached (RPC resolves)") end
+    }
+
+    assert {:ok, [{_hex, 0}]} =
+             B2gResolver.resolve(txid, 0, providers: providers, p2p_available?: true)
+  end
+
+  test "a P2P provider that RAISES degrades to the REST cascade" do
+    tx = fixture_tx()
+    txid = BSV.Transaction.txid_binary(tx)
+
+    providers = %{
+      p2p: fn _hex -> raise "fetcher boom" end,
+      rpc: fn _hex -> {:ok, tx} end,
+      junglebus: fn _hex -> flunk("JungleBus should not be reached") end,
+      whatsonchain: fn _hex -> flunk("WhatsOnChain should not be reached") end
+    }
+
+    assert {:ok, [{_hex, 0}]} =
+             B2gResolver.resolve(txid, 0, providers: providers, p2p_available?: true)
+  end
+
   test "cold start (no peers): P2P is skipped and the resolve uses RPC immediately" do
     tx = fixture_tx()
     txid = BSV.Transaction.txid_binary(tx)

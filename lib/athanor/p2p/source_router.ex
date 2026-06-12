@@ -121,12 +121,24 @@ defmodule Athanor.P2P.SourceRouter do
     if provider == :p2p and not p2p_available?(opts) do
       do_route(rest, attempt_fun, opts, last)
     else
-      case attempt_fun.(provider) do
+      case safe_attempt(attempt_fun, provider) do
         {:ok, _result} = ok -> ok
         :miss -> do_route(rest, attempt_fun, opts, last)
         {:error, _reason} = err -> do_route(rest, attempt_fun, opts, err)
       end
     end
+  end
+
+  # A provider that raises or exits (e.g. a `GenServer.call` to a down process, a
+  # client timeout) must NOT crash the whole route — it degrades to the next
+  # provider. Normalize any such failure to `{:error, _}` so routing continues.
+  defp safe_attempt(attempt_fun, provider) do
+    attempt_fun.(provider)
+  rescue
+    error -> {:error, {:provider_raised, provider, error}}
+  catch
+    :exit, reason -> {:error, {:provider_exited, provider, reason}}
+    kind, reason -> {:error, {:provider_threw, provider, kind, reason}}
   end
 
   defp p2p_available?(opts) do

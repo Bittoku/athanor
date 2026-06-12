@@ -56,9 +56,14 @@ defmodule Athanor.P2P.TxFetcher do
   Synchronously pull-fetches `txid` from the live peer set. Returns
   `{:ok, raw_bin}` on a hash-verified mempool hit, or `:miss` (zero peers, all
   `notfound`, or timeout). `opts[:call_timeout]` bounds the outer call wait.
+
+  The server is **explicit** (no default) so the arity is unambiguous: `fetch/2`
+  is always `(server, txid)` and `fetch/3` is `(server, txid, opts)` — there is no
+  arity where `(txid, opts)` could be misparsed as `(server, txid)`. Call the
+  supervised fetcher as `fetch(#{inspect(__MODULE__)}, txid, opts)`.
   """
   @spec fetch(GenServer.server(), Tracker.txid(), keyword()) :: {:ok, binary()} | :miss
-  def fetch(server \\ __MODULE__, txid, opts \\ []) do
+  def fetch(server, txid, opts \\ []) do
     GenServer.call(server, {:fetch, txid}, Keyword.get(opts, :call_timeout, 10_000))
   end
 

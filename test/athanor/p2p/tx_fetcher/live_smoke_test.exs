@@ -88,11 +88,11 @@ defmodule Athanor.P2P.TxFetcher.LiveSmokeTest do
         # No mempool txid supplied: an absent txid must miss within the timeout
         # (getdata → notfound/timeout), proving the miss path against live nodes.
         absent = :crypto.strong_rand_bytes(32)
-        assert TxFetcher.fetch(absent, call_timeout: 30_000) == :miss
+        assert TxFetcher.fetch(TxFetcher, absent, call_timeout: 30_000) == :miss
 
       txid_hex ->
         wire = display_to_wire(txid_hex)
-        assert {:ok, raw} = TxFetcher.fetch(wire, call_timeout: 30_000)
+        assert {:ok, raw} = TxFetcher.fetch(TxFetcher, wire, call_timeout: 30_000)
         # The served bytes hash to exactly the requested txid (the forgery guard).
         {:ok, tx, _rest} = BSV.Transaction.from_binary(raw)
         assert BSV.Transaction.txid_binary(tx) == wire

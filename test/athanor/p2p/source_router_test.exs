@@ -123,5 +123,40 @@ defmodule Athanor.P2P.SourceRouterTest do
       assert SourceRouter.route(:raw_tx_fetch, fn p -> {:error, p} end, p2p_available?: true) ==
                {:error, :whatsonchain}
     end
+
+    test "a provider that RAISES is normalized to an error and routing continues" do
+      result =
+        SourceRouter.route(
+          :raw_tx_fetch,
+          fn
+            :p2p -> raise "boom"
+            :rpc -> {:ok, "rpc"}
+            _ -> :miss
+          end,
+          p2p_available?: true
+        )
+
+      assert result == {:ok, "rpc"}
+    end
+
+    test "a provider that EXITS (e.g. a GenServer.call to a down process) does not crash routing" do
+      result =
+        SourceRouter.route(
+          :raw_tx_fetch,
+          fn
+            :p2p -> exit(:noproc)
+            :rpc -> {:ok, "rpc"}
+            _ -> :miss
+          end,
+          p2p_available?: true
+        )
+
+      assert result == {:ok, "rpc"}
+    end
+
+    test "if every provider crashes, the last normalized error is returned (no exit escapes)" do
+      assert {:error, {:provider_exited, :whatsonchain, _}} =
+               SourceRouter.route(:raw_tx_fetch, fn _ -> exit(:down) end, p2p_available?: true)
+    end
   end
 end

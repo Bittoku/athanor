@@ -157,15 +157,26 @@ defmodule Athanor.Indexer.B2gResolver do
   # the parent-fetch path that this MR deliberately does not alter.)
   defp p2p_fetch(txid_hex) do
     case Base.decode16(txid_hex, case: :mixed) do
-      {:ok, wire_txid} ->
-        case TxFetcher.fetch(wire_txid) do
-          {:ok, raw_bin} -> parse_bin(raw_bin)
-          :miss -> :miss
-        end
-
-      :error ->
-        :miss
+      {:ok, wire_txid} -> p2p_fetch_wire(wire_txid)
+      :error -> :miss
     end
+  end
+
+  # `TxFetcher.fetch/3` is a `GenServer.call`, which **exits** the caller if the
+  # fetcher is absent (mid supervisor-restart, name not yet registered) or the
+  # call times out. We must degrade to the REST/RPC cascade, not crash the b2g
+  # walk — so normalize any exit/exception to `:miss` (no P2P data) here, before
+  # the result reaches `SourceRouter.route/3`. This is what makes the P2P path
+  # genuinely fail-closed.
+  defp p2p_fetch_wire(wire_txid) do
+    case TxFetcher.fetch(TxFetcher, wire_txid) do
+      {:ok, raw_bin} -> parse_bin(raw_bin)
+      :miss -> :miss
+    end
+  rescue
+    _ -> :miss
+  catch
+    :exit, _ -> :miss
   end
 
   defp from_hex_client({:ok, raw_hex}), do: parse_hex(raw_hex)

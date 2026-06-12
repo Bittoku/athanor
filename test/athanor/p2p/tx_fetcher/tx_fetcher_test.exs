@@ -135,6 +135,15 @@ defmodule Athanor.P2P.TxFetcherTest do
     assert TxFetcher.fetch(fetcher, txid) == :miss
   end
 
+  test "fetch/3 (server, txid, opts) parses unambiguously — opts is not misread as the server" do
+    setup_registry()
+    {fetcher, _} = start_fetcher([])
+    {txid, _raw} = p2pkh_tx(0x4A)
+    # With the explicit-server arity, this is fetch(server, txid, opts) — the
+    # GenServer.call targets `fetcher`, not the txid binary (Blocker 2 regression).
+    assert TxFetcher.fetch(fetcher, txid, call_timeout: 5_000) == :miss
+  end
+
   test "fetch getdatas the selector-chosen peers and resolves {:ok, raw} on a matching tx" do
     setup_registry()
     {p, sock} = ready_peer()
