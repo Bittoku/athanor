@@ -281,4 +281,22 @@ defmodule Athanor.Services.BroadcastTest do
     assert_received {:broadcaster, _hex}
     assert record.status == "accepted"
   end
+
+  test "registry unavailable while P2P enabled: broadcast fails closed to the RPC path" do
+    # P2P enabled, but no PeerRegistry process → PeerRegistry.pids/0 exits. The
+    # peer gate must fail closed to RPC rather than crash before the fallback.
+    Application.put_env(:athanor, Athanor.P2P, enabled: true)
+    on_exit(fn -> Application.delete_env(:athanor, Athanor.P2P) end)
+
+    tx = build_tx()
+
+    assert {:ok, record} =
+             Broadcast.broadcast_tx(tx.hex,
+               relay: fn _, _ -> flunk("relay must not run when the registry is unavailable") end,
+               broadcaster: recording_broadcaster({:ok, tx.txid_hex})
+             )
+
+    assert_received {:broadcaster, _hex}
+    assert record.status == "accepted"
+  end
 end

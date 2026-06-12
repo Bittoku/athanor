@@ -145,7 +145,19 @@ defmodule Athanor.P2P.SourceRouter do
     case Keyword.fetch(opts, :p2p_available?) do
       {:ok, fun} when is_function(fun, 0) -> fun.()
       {:ok, bool} when is_boolean(bool) -> bool
-      :error -> Athanor.P2P.Supervisor.enabled?() and Athanor.P2P.PeerRegistry.pids() != []
+      :error -> Athanor.P2P.Supervisor.enabled?() and registry_has_peers?()
     end
+  end
+
+  # `PeerRegistry.pids/0` is a `GenServer.call` — it **exits** the caller if the
+  # registry is temporarily absent (mid supervisor-restart / cold start). The
+  # availability gate must fail **closed** (treat as "no peers") rather than crash
+  # before routing can skip `:p2p` and fall through to the REST/RPC providers.
+  defp registry_has_peers? do
+    Athanor.P2P.PeerRegistry.pids() != []
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
   end
 end

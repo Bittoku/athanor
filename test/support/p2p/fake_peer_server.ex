@@ -64,8 +64,7 @@ defmodule Athanor.P2P.FakePeerServer do
     # nil (default), `getdata` is ignored, leaving every prior test unchanged.
     tx_payload = Keyword.get(opts, :tx_payload)
 
-    {:ok, listen} =
-      :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, packet: :raw])
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, packet: :raw])
 
     {:ok, port} = :inet.port(listen)
 

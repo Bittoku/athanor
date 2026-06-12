@@ -216,8 +216,19 @@ defmodule Athanor.Services.Broadcast do
 
   defp peers_available?(opts) do
     Keyword.get_lazy(opts, :peers_available?, fn ->
-      Supervisor.enabled?() and PeerRegistry.pids() != []
+      Supervisor.enabled?() and registry_has_peers?()
     end)
+  end
+
+  # `PeerRegistry.pids/0` is a `GenServer.call` that **exits** if the registry is
+  # temporarily absent (supervisor restart / cold start). Fail **closed** to the
+  # RPC path rather than crash before `rpc_broadcast/3` is reached.
+  defp registry_has_peers? do
+    PeerRegistry.pids() != []
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
   end
 
   # The P2P relay path is taken only when the capability router routes

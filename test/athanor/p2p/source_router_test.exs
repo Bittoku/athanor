@@ -158,5 +158,21 @@ defmodule Athanor.P2P.SourceRouterTest do
       assert {:error, {:provider_exited, :whatsonchain, _}} =
                SourceRouter.route(:raw_tx_fetch, fn _ -> exit(:down) end, p2p_available?: true)
     end
+
+    test "default gate fails closed when P2P is enabled but PeerRegistry is unavailable" do
+      # P2P enabled, but no PeerRegistry process → PeerRegistry.pids/0 exits. The
+      # availability gate must treat that as 'no peers' and route to RPC, not crash.
+      Application.put_env(:athanor, Athanor.P2P, enabled: true)
+      on_exit(fn -> Application.delete_env(:athanor, Athanor.P2P) end)
+
+      result =
+        SourceRouter.route(:raw_tx_fetch, fn
+          :p2p -> flunk(":p2p must be skipped when the registry is unavailable")
+          :rpc -> {:ok, "rpc"}
+          _ -> :miss
+        end)
+
+      assert result == {:ok, "rpc"}
+    end
   end
 end
