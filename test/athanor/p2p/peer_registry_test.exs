@@ -84,4 +84,36 @@ defmodule Athanor.P2P.PeerRegistryTest do
     send(p1, :stop)
     send(p2, :stop)
   end
+
+  test "rejects registering the same pid under a second address (pid-safe)", %{reg: reg} do
+    a1 = addr(1)
+    a2 = addr(2)
+    p = holder()
+
+    assert :ok = PeerRegistry.register(reg, a1, p)
+    # The same pid cannot map to a second address — that would let a stale
+    # address survive the pid's death.
+    assert {:error, :pid_already_registered} = PeerRegistry.register(reg, a2, p)
+    assert :error = PeerRegistry.lookup(reg, a2)
+
+    send(p, :stop)
+  end
+
+  test "a dead pid leaves no stale address even after a rejected duplicate", %{reg: reg} do
+    a1 = addr(1)
+    a2 = addr(2)
+    p = holder()
+
+    :ok = PeerRegistry.register(reg, a1, p)
+    {:error, :pid_already_registered} = PeerRegistry.register(reg, a2, p)
+
+    ref = Process.monitor(p)
+    send(p, :stop)
+    assert_receive {:DOWN, ^ref, :process, ^p, _}
+
+    # Neither address may linger once the pid is gone.
+    assert PeerRegistry.addresses(reg) == []
+    assert :error = PeerRegistry.lookup(reg, a1)
+    assert :error = PeerRegistry.lookup(reg, a2)
+  end
 end
