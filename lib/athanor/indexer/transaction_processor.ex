@@ -26,10 +26,16 @@ defmodule Athanor.Indexer.TransactionProcessor do
   end
 
   @doc """
-  Synchronously process a transaction (for block processing).
+  Synchronously process a transaction (for block processing). `source` tags the
+  observation's provider (`:p2p | :zmq | :junglebus | :whatsonchain | :bitails |
+  :block | :unknown`); it is recorded in `MetaTransaction.metadata["sources"]`.
   """
-  def process_tx(tx, matched_addresses, matched_tokens) do
-    GenServer.call(__MODULE__, {:process_tx, tx, matched_addresses, matched_tokens}, 30_000)
+  def process_tx(tx, matched_addresses, matched_tokens, source \\ :unknown) do
+    GenServer.call(
+      __MODULE__,
+      {:process_tx, tx, matched_addresses, matched_tokens, source},
+      30_000
+    )
   end
 
   ## ── Server Callbacks ──
@@ -40,16 +46,24 @@ defmodule Athanor.Indexer.TransactionProcessor do
   end
 
   @impl true
-  def handle_cast({:index_tx, tx, matched_addresses, matched_tokens}, state) do
-    do_index_tx(tx, matched_addresses, matched_tokens, nil)
+  def handle_cast({:index_tx, tx, matched_addresses, matched_tokens, source}, state) do
+    do_index_tx(tx, matched_addresses, matched_tokens, nil, source)
     {:noreply, %{state | processed_count: state.processed_count + 1}}
   end
 
+  # Back-compat: a 4-tuple cast (no source) defaults to :unknown.
+  def handle_cast({:index_tx, tx, matched_addresses, matched_tokens}, state),
+    do: handle_cast({:index_tx, tx, matched_addresses, matched_tokens, :unknown}, state)
+
   @impl true
-  def handle_call({:process_tx, tx, matched_addresses, matched_tokens}, _from, state) do
-    result = do_index_tx(tx, matched_addresses, matched_tokens, nil)
+  def handle_call({:process_tx, tx, matched_addresses, matched_tokens, source}, _from, state) do
+    result = do_index_tx(tx, matched_addresses, matched_tokens, nil, source)
     {:reply, result, %{state | processed_count: state.processed_count + 1}}
   end
+
+  # Back-compat: a 4-tuple call (no source) defaults to :unknown.
+  def handle_call({:process_tx, tx, matched_addresses, matched_tokens}, from, state),
+    do: handle_call({:process_tx, tx, matched_addresses, matched_tokens, :unknown}, from, state)
 
   @impl true
   def handle_info(_msg, state) do
@@ -58,9 +72,66 @@ defmodule Athanor.Indexer.TransactionProcessor do
 
   ## ── Private ──
 
-  defp do_index_tx(tx, matched_addresses, matched_tokens, block_height) do
+  # Unions a new `source` into the existing `metadata["sources"]` set (or seeds
+  # it on first sight). Order-independent; deduped.
+  defp merge_sources(nil, source), do: [to_string(source)]
+
+  defp merge_sources(%MetaTransaction{metadata: metadata}, source) do
+    existing = (is_map(metadata) && Map.get(metadata, "sources")) || []
+    Enum.uniq(existing ++ [to_string(source)])
+  end
+
+  defp do_index_tx(tx, matched_addresses, matched_tokens, block_height, source) do
     txid_binary = Transaction.txid_binary(tx)
     txid_hex = Transaction.tx_id_hex(tx)
+
+    # Source tagging + dedupe (plan §2.5): first observation indexes fully;
+    # a re-observation of the SAME txid (e.g. seen via REST then P2P) must only
+    # union its `source` into `metadata["sources"]` and return — WITHOUT
+    # replaying first-index side effects (input spends, UTXO creation,
+    # address-history rows, PubSub, waiter reprocessing) and WITHOUT touching
+    # the confirmation columns (`is_confirmed`/`block_height`), which are owned
+    # by the block processor. First-seen wins for indexing; duplicates only add
+    # their source. No schema migration.
+    case Repo.get_by(MetaTransaction, txid: txid_binary) do
+      %MetaTransaction{} = existing ->
+        union_source_only(existing, source)
+        {:ok, txid_hex}
+
+      nil ->
+        index_new_tx(
+          tx,
+          matched_addresses,
+          matched_tokens,
+          block_height,
+          source,
+          txid_binary,
+          txid_hex
+        )
+    end
+  end
+
+  # Re-observation path. Union `source` into the existing row's
+  # `metadata["sources"]` set and persist nothing else.
+  defp union_source_only(%MetaTransaction{} = existing, source) do
+    new_metadata = Map.put(existing.metadata || %{}, "sources", merge_sources(existing, source))
+
+    existing
+    |> MetaTransaction.changeset(%{metadata: new_metadata})
+    |> Repo.update()
+  end
+
+  # First-index path: the full pipeline (meta insert → input spends → UTXO
+  # creation → address history → PubSub → waiter reprocessing).
+  defp index_new_tx(
+         tx,
+         matched_addresses,
+         matched_tokens,
+         block_height,
+         source,
+         txid_binary,
+         txid_hex
+       ) do
     tx_hex = Transaction.to_hex(tx)
 
     # Classify all outputs
@@ -77,7 +148,8 @@ defmodule Athanor.Indexer.TransactionProcessor do
     # the naive script-derived tag).
     stas_attrs = compute_stas_attributes(tx, classified)
 
-    # 1. Store MetaTransaction
+    # 1. Store MetaTransaction (first sight). Seed `metadata["sources"]` with the
+    # observing source.
     meta_attrs = %{
       txid: txid_binary,
       hex: tx_hex,
@@ -86,21 +158,13 @@ defmodule Athanor.Indexer.TransactionProcessor do
       timestamp: System.os_time(:second),
       addresses: all_addresses,
       token_ids: all_token_ids,
-      metadata: stas_attrs.flags
+      metadata: Map.put(stas_attrs.flags, "sources", merge_sources(nil, source))
     }
 
     _meta_result =
-      case Repo.get_by(MetaTransaction, txid: txid_binary) do
-        nil ->
-          %MetaTransaction{}
-          |> MetaTransaction.changeset(meta_attrs)
-          |> Repo.insert()
-
-        existing ->
-          existing
-          |> MetaTransaction.changeset(meta_attrs)
-          |> Repo.update()
-      end
+      %MetaTransaction{}
+      |> MetaTransaction.changeset(meta_attrs)
+      |> Repo.insert()
 
     # 2. Process inputs — mark UTXOs as spent. STAS 3.0 spec v0.1 §8.2 / §9.6:
     # the unlocking script encodes a `spendType` byte that classifies the
@@ -293,8 +357,14 @@ defmodule Athanor.Indexer.TransactionProcessor do
 
       now_resolved? = stas_attrs.flags["all_stas_inputs_known"] == true
 
+      # Recompute the lineage flags but PRESERVE unrelated metadata keys —
+      # especially `"sources"` (Phase 3 §A). Fresh flags win on conflicting
+      # keys (`is_stas`, `illegal_roots`, `missing_transactions`, …); the
+      # source set and any other non-flag keys survive.
+      merged_metadata = Map.merge(waiter.metadata || %{}, stas_attrs.flags)
+
       waiter
-      |> MetaTransaction.changeset(%{metadata: stas_attrs.flags})
+      |> MetaTransaction.changeset(%{metadata: merged_metadata})
       |> Repo.update()
 
       Enum.each(stas_attrs.token_id_per_vout, fn {vout, new_token_id} ->

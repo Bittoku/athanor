@@ -35,7 +35,8 @@ defmodule Athanor.P2P.PeerPool.Config do
             transport_opts: [],
             seeds: [],
             cooldown_ms: 900_000,
-            now_fun: nil
+            now_fun: nil,
+            frame_sink: nil
 
   @type addr :: {{byte(), byte(), byte(), byte()}, :inet.port_number()}
   @type t :: %__MODULE__{
@@ -48,6 +49,7 @@ defmodule Athanor.P2P.PeerPool.Config do
           transport_opts: keyword(),
           seeds: [addr()],
           cooldown_ms: non_neg_integer(),
-          now_fun: (-> integer()) | nil
+          now_fun: (-> integer()) | nil,
+          frame_sink: pid() | nil
         }
 end

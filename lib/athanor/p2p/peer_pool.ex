@@ -85,20 +85,13 @@ defmodule Athanor.P2P.PeerPool do
     end
   end
 
-  # A peer forwarded `addr` gossip: absorb the routable addresses it advertises
-  # into the book and try to fill any open slots with the newly learned peers.
-  def handle_info({:peer, _pid, :frame, %Frame{command: "addr", payload: payload}}, state) do
-    learned =
-      case Addr.parse(payload) do
-        {:ok, entries, _rest} -> Discovery.absorb_addr(entries)
-        _ -> []
-      end
-
-    {:noreply, fill(%{state | book: AddrBook.add_candidates(state.book, learned)})}
+  # A peer forwarded an application frame. Route it to the configured frame_sink
+  # (the mempool observer, Phase 3 §C) with the originating peer pid, and absorb
+  # any `addr` gossip into the book (pool-internal discovery).
+  def handle_info({:peer, _pid, :frame, %Frame{} = frame} = msg, state) do
+    if state.config.frame_sink, do: send(state.config.frame_sink, msg)
+    {:noreply, absorb_gossip(frame, state)}
   end
-
-  # Any other forwarded frame is ignored by the pool (consumed by Phase 3 ingest).
-  def handle_info({:peer, _pid, :frame, _frame}, state), do: {:noreply, state}
 
   def handle_info(:refresh, state) do
     schedule_refresh()
@@ -106,6 +99,19 @@ defmodule Athanor.P2P.PeerPool do
   end
 
   ## Internals
+
+  # Absorb `addr` gossip into the book and try to fill; other frames pass through.
+  defp absorb_gossip(%Frame{command: "addr", payload: payload}, state) do
+    learned =
+      case Addr.parse(payload) do
+        {:ok, entries, _rest} -> Discovery.absorb_addr(entries)
+        _ -> []
+      end
+
+    fill(%{state | book: AddrBook.add_candidates(state.book, learned)})
+  end
+
+  defp absorb_gossip(%Frame{}, state), do: state
 
   # Dial every selection the address book hands us this tick.
   defp fill(state) do

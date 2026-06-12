@@ -82,12 +82,15 @@ defmodule Athanor.Indexer.TransactionFilter do
 
   ## Parameters
     - `raw_tx_binary` — raw transaction bytes
+    - `source` — observation provider, threaded into
+      `MetaTransaction.metadata["sources"]` (`:zmq | :junglebus | :whatsonchain
+      | :p2p | :block | :unknown`). Defaults to `:unknown`.
 
   ## Returns
     :ok
   """
-  def process_raw_tx(raw_tx_binary) do
-    GenServer.cast(__MODULE__, {:process_raw_tx, raw_tx_binary})
+  def process_raw_tx(raw_tx_binary, source \\ :unknown) do
+    GenServer.cast(__MODULE__, {:process_raw_tx, raw_tx_binary, source})
   end
 
   @doc """
@@ -130,19 +133,19 @@ defmodule Athanor.Indexer.TransactionFilter do
   end
 
   @impl true
-  def handle_cast({:process_raw_tx, raw_tx_binary}, state) do
+  def handle_cast({:process_raw_tx, raw_tx_binary, source}, state) do
     case BSV.Transaction.from_binary(raw_tx_binary) do
       {:ok, tx, _rest} ->
         {matched_addresses, matched_tokens} = scan_outputs(tx.outputs)
 
         if matched_addresses != [] or matched_tokens != [] do
           Logger.info(
-            "TransactionFilter matched addrs=#{inspect(matched_addresses)} tokens=#{inspect(matched_tokens)}"
+            "TransactionFilter matched addrs=#{inspect(matched_addresses)} tokens=#{inspect(matched_tokens)} source=#{source}"
           )
 
           GenServer.cast(
             Athanor.Indexer.TransactionProcessor,
-            {:index_tx, tx, matched_addresses, matched_tokens}
+            {:index_tx, tx, matched_addresses, matched_tokens, source}
           )
         end
 
@@ -152,6 +155,10 @@ defmodule Athanor.Indexer.TransactionFilter do
 
     {:noreply, state}
   end
+
+  # Back-compat: a 2-tuple cast (no source) defaults to :unknown.
+  def handle_cast({:process_raw_tx, raw_tx_binary}, state),
+    do: handle_cast({:process_raw_tx, raw_tx_binary, :unknown}, state)
 
   @impl true
   def handle_info(_msg, state) do

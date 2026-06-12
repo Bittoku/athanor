@@ -113,7 +113,11 @@ defmodule Athanor.Blockchain.JungleBusClient do
     Logger.info("JungleBusClient: starting SSE subscription #{state.subscription_id}")
     # Start SSE streaming in a linked task
     parent = self()
-    Task.start_link(fn -> stream_sse(state.url, state.subscription_id, state.last_block_height, parent) end)
+
+    Task.start_link(fn ->
+      stream_sse(state.url, state.subscription_id, state.last_block_height, parent)
+    end)
+
     {:noreply, state}
   end
 
@@ -294,7 +298,8 @@ defmodule Athanor.Blockchain.JungleBusClient do
   defp process_junglebus_tx(%{"transaction" => base64_tx} = _data) when is_binary(base64_tx) do
     case Base.decode64(base64_tx) do
       {:ok, raw_binary} ->
-        TransactionFilter.process_raw_tx(raw_binary)
+        # Source-tag the observation (Phase 3 §A): JungleBus stream → `:junglebus`.
+        TransactionFilter.process_raw_tx(raw_binary, :junglebus)
 
       :error ->
         Logger.warning("JungleBusClient: invalid base64 transaction data")

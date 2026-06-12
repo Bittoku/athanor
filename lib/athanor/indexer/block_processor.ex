@@ -118,7 +118,8 @@ defmodule Athanor.Indexer.BlockProcessor do
                 {matched_addrs, matched_tokens} = TransactionFilter.matches?(tx)
 
                 if matched_addrs != [] or matched_tokens != [] do
-                  TransactionProcessor.process_tx(tx, matched_addrs, matched_tokens)
+                  # Source-tag the observation (Phase 3 §A): block indexing → `:block`.
+                  TransactionProcessor.process_tx(tx, matched_addrs, matched_tokens, :block)
                 end
 
               _ ->
@@ -185,7 +186,10 @@ defmodule Athanor.Indexer.BlockProcessor do
 
       %{id: stored_hash} ->
         # Reorg detected!
-        Logger.warning("REORG detected at height #{expected_height}: expected #{prev_hash}, have #{stored_hash}")
+        Logger.warning(
+          "REORG detected at height #{expected_height}: expected #{prev_hash}, have #{stored_hash}"
+        )
+
         rollback_to(expected_height - 1)
     end
   end

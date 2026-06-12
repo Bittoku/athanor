@@ -43,6 +43,15 @@ defmodule Athanor.P2P.Peer do
   @spec stop(GenServer.server()) :: :ok
   def stop(peer), do: GenServer.cast(peer, :stop)
 
+  @doc """
+  Writes an outbound frame on `peer` (e.g. `getdata` to request a tx). A no-op
+  unless the peer is in steady state (`:ready`). This is the production seam by
+  which the mempool observer commands an already-handshaked peer (Phase 3, §C).
+  """
+  @spec send_frame(GenServer.server(), atom(), binary()) :: :ok
+  def send_frame(peer, command, payload),
+    do: GenServer.cast(peer, {:send_frame, command, payload})
+
   @impl true
   def init(%Config{} = config) do
     state = %{
@@ -151,6 +160,17 @@ defmodule Athanor.P2P.Peer do
   def handle_info({:inactivity, _stale}, state), do: {:noreply, state}
 
   @impl true
+  def handle_cast(
+        {:send_frame, command, payload},
+        %{phase: :ready, config: c, socket: socket} = state
+      ) do
+    c.transport.send(socket, Frame.encode(c.network, command, payload))
+    {:noreply, state}
+  end
+
+  # Before :ready there is no steady-state connection to write on — drop it.
+  def handle_cast({:send_frame, _command, _payload}, state), do: {:noreply, state}
+
   def handle_cast(:stop, state) do
     notify(state, {:down, :stopped})
     {:stop, :normal, state}
