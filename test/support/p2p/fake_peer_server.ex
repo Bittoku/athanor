@@ -8,22 +8,45 @@ defmodule Athanor.P2P.FakePeerServer do
   On accept it runs a fixed script:
 
     1. reply to the client's `version` with its own `version` + `verack`;
-    2. after the client's `verack`, send an `inv` (one tx hash) then a `ping`;
+    2. after the client's `verack`, send an `inv` (one tx hash) then a `ping`
+       (unless `:announce_on_verack` is false — a quiet handshake);
     3. when the client's answering `pong` arrives, report it to `:report_to`
        and close the connection (so the client observes `:down, :closed`).
 
   `start/1` returns `{:ok, port, server_pid}`; point a `Peer` at `port`.
+
+  ## Phase 4 (T4.3) — outbound broadcast round-trip
+
+  For the self-broadcast integration test the server is driven, per-server, as
+  either an **announce target** or a **held-back peer**:
+
+    * `:announce_on_verack` (default `true`) — when `false`, the server stays
+      quiet after the handshake (no `inv`/`ping`), so the only `inv` it sends is
+      the explicit relay-back below.
+    * `:serve_on_inv` (default `false`) — when `true`, an `inv` *from the client*
+      (our announce) is answered with a `getdata` for those tx hashes; the
+      configured `:tx_payload` is then served back, so the **announce target**
+      pulls our tx over the wire. A received `tx` is reported as
+      `{:server_received, :tx, byte_size}`.
+    * `:relay_back_hash` (32 bytes) + the `{:cmd, :relay_back}` message — on that
+      message the server sends `inv(relay_back_hash)`, simulating a peer that
+      learned the tx **from the network** (a relay-back). The test sends the
+      command *after* `broadcast_tx` has recorded the pending broadcast, so the
+      relay-back is counted rather than dropped as unknown.
   """
 
   alias Athanor.P2P.{Frame, FrameBuffer}
   alias Athanor.P2P.Messages.{Inv, Version}
 
+  @max_inv_items 50_000
+
   @doc """
   Starts the fake server on an ephemeral loopback port.
 
   Options: `:network` (required), `:report_to` (pid, required), `:peer_version`
-  (the `%Version{}` to advertise, required), `:inv_hash` (32 bytes), and
-  `:ping_nonce`.
+  (the `%Version{}` to advertise, required), `:inv_hash` (32 bytes),
+  `:ping_nonce`, `:linger`, `:tx_payload`, and the Phase-4 round-trip seams
+  `:announce_on_verack`, `:serve_on_inv`, `:relay_back_hash` (see the module doc).
   """
   @spec start(keyword()) :: {:ok, :inet.port_number(), pid()}
   def start(opts) do
@@ -53,7 +76,11 @@ defmodule Athanor.P2P.FakePeerServer do
       inv_hash: inv_hash,
       ping_nonce: ping_nonce,
       linger: linger,
-      tx_payload: tx_payload
+      tx_payload: tx_payload,
+      # Phase 4 round-trip seams (default to the pre-Phase-4 behavior).
+      announce_on_verack: Keyword.get(opts, :announce_on_verack, true),
+      serve_on_inv: Keyword.get(opts, :serve_on_inv, false),
+      relay_back_hash: Keyword.get(opts, :relay_back_hash)
     }
 
     pid = spawn_link(fn -> accept(listen, script) end)
@@ -66,15 +93,37 @@ defmodule Athanor.P2P.FakePeerServer do
     serve(sock, FrameBuffer.new(script.network), %{hello?: false, payload?: false}, script)
   end
 
+  # A blocking recv with a short timeout so the process stays responsive to
+  # out-of-band test commands (e.g. `{:cmd, :relay_back}`) between socket reads.
   defp serve(sock, buffer, progress, script) do
-    case :gen_tcp.recv(sock, 0) do
+    progress = drain_commands(sock, progress, script)
+
+    case :gen_tcp.recv(sock, 0, 50) do
       {:ok, data} ->
         {frames, buffer} = FrameBuffer.push(buffer, data)
         progress = Enum.reduce(frames, progress, &react(&1, sock, &2, script))
         serve(sock, buffer, progress, script)
 
+      {:error, :timeout} ->
+        serve(sock, buffer, progress, script)
+
       {:error, _closed} ->
         :ok
+    end
+  end
+
+  # Drain queued test commands without blocking. `{:cmd, :relay_back}` sends an
+  # `inv(relay_back_hash)` — a peer advertising the tx back to us (T4.3).
+  defp drain_commands(sock, progress, script) do
+    receive do
+      {:cmd, :relay_back} ->
+        if is_binary(script.relay_back_hash),
+          do:
+            send_frame(sock, script.network, :inv, Inv.serialize([{:tx, script.relay_back_hash}]))
+
+        drain_commands(sock, progress, script)
+    after
+      0 -> progress
     end
   end
 
@@ -85,10 +134,14 @@ defmodule Athanor.P2P.FakePeerServer do
     %{progress | hello?: true}
   end
 
-  # After the client's verack, push an inv then a ping (once).
+  # After the client's verack, push an inv then a ping (once) — unless this
+  # server is configured for a quiet handshake (Phase 4 T4.3).
   defp react(%Frame{command: "verack"}, sock, %{payload?: false} = progress, script) do
-    send_frame(sock, script.network, :inv, Inv.serialize([{:tx, script.inv_hash}]))
-    send_frame(sock, script.network, :ping, <<script.ping_nonce::little-64>>)
+    if script.announce_on_verack do
+      send_frame(sock, script.network, :inv, Inv.serialize([{:tx, script.inv_hash}]))
+      send_frame(sock, script.network, :ping, <<script.ping_nonce::little-64>>)
+    end
+
     %{progress | payload?: true}
   end
 
@@ -99,11 +152,37 @@ defmodule Athanor.P2P.FakePeerServer do
     progress
   end
 
-  # Answer a `getdata` with the configured raw tx (T3.4). The observer requests
+  # The client announced a tx to us (our broadcast): request it so the announce
+  # target pulls our tx over the wire (T4.3, `serve_on_inv`).
+  defp react(
+         %Frame{command: "inv", payload: payload},
+         sock,
+         progress,
+         %{serve_on_inv: true} = script
+       ) do
+    case Inv.parse(payload, max_items: @max_inv_items) do
+      {:ok, items, _rest} ->
+        for {:tx, hash} <- items,
+            do: send_frame(sock, script.network, :getdata, Inv.serialize([{:tx, hash}]))
+
+      _ ->
+        :ok
+    end
+
+    progress
+  end
+
+  # Answer a `getdata` with the configured raw tx (T3.4/T4.3). The peer requests
   # the tx it was inv'd; we serve the bytes whose hash the client will verify.
   defp react(%Frame{command: "getdata"}, sock, progress, %{tx_payload: payload} = script)
        when is_binary(payload) do
     send_frame(sock, script.network, :tx, payload)
+    progress
+  end
+
+  # The client served us a tx (T4.3 round-trip evidence): report it.
+  defp react(%Frame{command: "tx", payload: payload}, _sock, progress, script) do
+    send(script.report_to, {:server_received, :tx, byte_size(payload)})
     progress
   end
 

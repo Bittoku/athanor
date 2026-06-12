@@ -49,6 +49,13 @@ defmodule Athanor.P2P.PeerRegistry do
   @spec addresses(GenServer.server()) :: [addr()]
   def addresses(server \\ __MODULE__), do: GenServer.call(server, :addresses)
 
+  @doc """
+  All live peer pids (Phase 4 §A seam). The `TxRelay` reads these to pick its
+  announce/hold-back targets without reaching into pool internals.
+  """
+  @spec pids(GenServer.server()) :: [pid()]
+  def pids(server \\ __MODULE__), do: GenServer.call(server, :pids)
+
   @doc "The set of /24s occupied by live peers (for diversity checks)."
   @spec slash24s(GenServer.server()) :: MapSet.t(slash24())
   def slash24s(server \\ __MODULE__) do
@@ -92,6 +99,8 @@ defmodule Athanor.P2P.PeerRegistry do
   end
 
   def handle_call(:addresses, _from, state), do: {:reply, Map.keys(state.by_addr), state}
+
+  def handle_call(:pids, _from, state), do: {:reply, Map.values(state.by_addr), state}
 
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
