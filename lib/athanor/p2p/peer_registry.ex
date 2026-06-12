@@ -62,18 +62,26 @@ defmodule Athanor.P2P.PeerRegistry do
 
   @impl true
   def handle_call({:register, addr, pid}, _from, state) do
-    if Map.has_key?(state.by_addr, addr) do
-      {:reply, {:error, :already_registered}, state}
-    else
-      ref = Process.monitor(pid)
+    cond do
+      Map.has_key?(state.by_addr, addr) ->
+        {:reply, {:error, :already_registered}, state}
 
-      state = %{
-        state
-        | by_addr: Map.put(state.by_addr, addr, pid),
-          by_pid: Map.put(state.by_pid, pid, {addr, ref})
-      }
+      # A pid maps to exactly one address. Allowing a pid under a second address
+      # would let the first address survive the pid's death (`by_pid` is keyed by
+      # pid, so the :DOWN handler only sees the latest entry).
+      Map.has_key?(state.by_pid, pid) ->
+        {:reply, {:error, :pid_already_registered}, state}
 
-      {:reply, :ok, state}
+      true ->
+        ref = Process.monitor(pid)
+
+        state = %{
+          state
+          | by_addr: Map.put(state.by_addr, addr, pid),
+            by_pid: Map.put(state.by_pid, pid, {addr, ref})
+        }
+
+        {:reply, :ok, state}
     end
   end
 
