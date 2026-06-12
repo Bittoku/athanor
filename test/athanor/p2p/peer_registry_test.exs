@@ -41,6 +41,18 @@ defmodule Athanor.P2P.PeerRegistryTest do
     send(p, :stop)
   end
 
+  test "pids/1 returns the live peer pids (Phase 4 §A seam)", %{reg: reg} do
+    p1 = holder()
+    p2 = holder()
+    assert :ok = PeerRegistry.register(reg, addr(1), p1)
+    assert :ok = PeerRegistry.register(reg, addr(2), p2)
+
+    assert MapSet.new(PeerRegistry.pids(reg)) == MapSet.new([p1, p2])
+
+    send(p1, :stop)
+    send(p2, :stop)
+  end
+
   test "a second register for a taken address is rejected (unique keys)", %{reg: reg} do
     a = addr(1)
     p1 = holder()

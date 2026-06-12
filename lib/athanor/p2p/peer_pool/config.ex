@@ -19,10 +19,12 @@ defmodule Athanor.P2P.PeerPool.Config do
       before it is eligible to redial (default 15 min).
     * `:now_fun` — `fn -> integer_ms` clock (default monotonic ms); injected in
       tests to drive cooldown deterministically.
-    * `:frame_sink` — optional `pid` or registered name (Phase 3, §C). When set,
-      every post-handshake application frame is forwarded to it as
+    * `:frame_sink` — optional sink, or **list of sinks** (Phase 3 §C, Phase 4 §A
+      fan-out). A sink is a `pid` or registered name. When set, every
+      post-handshake application frame is forwarded to **each** sink as
       `{:peer, pid, :frame, %Frame{}}` (the pool still owns peer lifecycle); the
-      `MempoolObserver` registers here. `nil` (default) leaves behavior unchanged.
+      `MempoolObserver` and (Phase 4) the `TxRelay` register here. `nil` (default)
+      leaves behavior unchanged.
   """
 
   alias Athanor.P2P.Network
@@ -54,6 +56,9 @@ defmodule Athanor.P2P.PeerPool.Config do
           seeds: [addr()],
           cooldown_ms: non_neg_integer(),
           now_fun: (-> integer()) | nil,
-          frame_sink: pid() | atom() | nil
+          frame_sink: sink() | [sink()] | nil
         }
+
+  @typedoc "A single frame-sink target: a pid or a registered name."
+  @type sink :: pid() | atom()
 end

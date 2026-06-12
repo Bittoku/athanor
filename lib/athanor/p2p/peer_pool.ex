@@ -85,11 +85,13 @@ defmodule Athanor.P2P.PeerPool do
     end
   end
 
-  # A peer forwarded an application frame. Route it to the configured frame_sink
-  # (the mempool observer, Phase 3 §C) with the originating peer pid, and absorb
-  # any `addr` gossip into the book (pool-internal discovery).
+  # A peer forwarded an application frame. Route it to the configured
+  # frame_sink(s) — the mempool observer and, in Phase 4, the tx relay (§A
+  # fan-out) — with the originating peer pid, and absorb any `addr` gossip into
+  # the book (pool-internal discovery). `frame_sink` may be a single pid/name, a
+  # list of them, or `nil`; `List.wrap/1` normalizes all three (`nil` → no send).
   def handle_info({:peer, _pid, :frame, %Frame{} = frame} = msg, state) do
-    if state.config.frame_sink, do: send(state.config.frame_sink, msg)
+    for sink <- List.wrap(state.config.frame_sink), do: send(sink, msg)
     {:noreply, absorb_gossip(frame, state)}
   end
 

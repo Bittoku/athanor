@@ -71,6 +71,21 @@ defmodule Athanor.P2P.PeerPoolFrameSinkTest do
     assert_receive {:peer, ^pid, :frame, %Frame{command: "inv"}}
   end
 
+  test "fans a frame out to every sink when frame_sink is a list (Phase 4 §A)" do
+    test = self()
+    relay = spawn(fn -> receive do: (m -> send(test, {:relayed, m})) end)
+    pool = start_pool(frame_sink: [self(), relay])
+    assert_receive {:dialed, _cfg, pid}
+    send(pool, {:peer, pid, :ready, ver()})
+    _ = :sys.get_state(pool)
+
+    send(pool, {:peer, pid, :frame, %Frame{command: "inv", payload: <<>>}})
+
+    # Both sinks receive the same forwarded message.
+    assert_receive {:peer, ^pid, :frame, %Frame{command: "inv"}}
+    assert_receive {:relayed, {:peer, ^pid, :frame, %Frame{command: "inv"}}}
+  end
+
   test "does not forward when no frame_sink is configured (default)" do
     pool = start_pool([])
     assert_receive {:dialed, _cfg, pid}
