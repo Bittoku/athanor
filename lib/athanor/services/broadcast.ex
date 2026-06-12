@@ -41,7 +41,7 @@ defmodule Athanor.Services.Broadcast do
   """
 
   alias Athanor.Blockchain.RpcClient
-  alias Athanor.P2P.{PeerRegistry, Supervisor, TxRelay}
+  alias Athanor.P2P.{PeerRegistry, SourceRouter, Supervisor, TxRelay}
   alias Athanor.Repo
   alias Athanor.Schema.Broadcast
 
@@ -122,10 +122,11 @@ defmodule Athanor.Services.Broadcast do
       |> Broadcast.changeset(%{txid: txid_hex, hex: raw_tx_hex, status: "pending"})
       |> Repo.insert()
 
-    if peers_available?(opts) do
+    if p2p_broadcast?(opts) do
       relay_route(broadcast, raw_tx_hex, txid_bin, raw_bin, opts)
     else
-      # Cold start: P2P disabled or no live peers — exactly today's RPC-only path.
+      # Cold start (P2P disabled / no live peers), or the router has routed
+      # `:broadcast` away from `:p2p` — exactly today's RPC-only path.
       rpc_broadcast(broadcast, raw_tx_hex, opts)
     end
   end
@@ -217,6 +218,14 @@ defmodule Athanor.Services.Broadcast do
     Keyword.get_lazy(opts, :peers_available?, fn ->
       Supervisor.enabled?() and PeerRegistry.pids() != []
     end)
+  end
+
+  # The P2P relay path is taken only when the capability router routes
+  # `:broadcast` to `:p2p` (the default) **and** live peers exist. Routing
+  # `:broadcast` to a non-P2P provider via config forces the RPC-only path even
+  # with peers — so P2P-vs-RPC is one routing decision (§C), config not hardcode.
+  defp p2p_broadcast?(opts) do
+    match?({:p2p, _fallbacks}, SourceRouter.resolve(:broadcast)) and peers_available?(opts)
   end
 
   defp p2p_env, do: Application.get_env(:athanor, Athanor.P2P, [])

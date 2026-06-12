@@ -260,4 +260,25 @@ defmodule Athanor.Services.BroadcastTest do
   test "apply_relay_event for an unknown txid is a no-op" do
     assert :ok = Broadcast.apply_relay_event({:propagated, :binary.copy(<<0x7E>>, 32)})
   end
+
+  # ── Phase 5 T5.4: broadcast is router-driven ──
+
+  test "routing :broadcast away from :p2p forces RPC-only even with live peers" do
+    Application.put_env(:athanor, Athanor.P2P.SourceRouter, routes: %{broadcast: {:rpc, []}})
+    on_exit(fn -> Application.delete_env(:athanor, Athanor.P2P.SourceRouter) end)
+
+    tx = build_tx()
+
+    assert {:ok, record} =
+             Broadcast.broadcast_tx(tx.hex,
+               peers_available?: true,
+               relay: fn _, _ ->
+                 flunk("relay must not run when router routes broadcast to :rpc")
+               end,
+               broadcaster: recording_broadcaster({:ok, tx.txid_hex})
+             )
+
+    assert_received {:broadcaster, _hex}
+    assert record.status == "accepted"
+  end
 end
