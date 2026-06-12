@@ -32,6 +32,10 @@ defmodule Athanor.P2P.FakePeerServer do
     peer_version = Keyword.fetch!(opts, :peer_version)
     inv_hash = Keyword.get(opts, :inv_hash, :binary.copy(<<0xAB>>, 32))
     ping_nonce = Keyword.get(opts, :ping_nonce, 7777)
+    # When true, keep the connection open after pong (a persistent peer, used by
+    # the pool integration test); when false (default), close after pong to
+    # exercise the client's :closed path (Phase 1 T1.7).
+    linger = Keyword.get(opts, :linger, false)
 
     {:ok, listen} =
       :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, packet: :raw])
@@ -43,7 +47,8 @@ defmodule Athanor.P2P.FakePeerServer do
       report_to: report_to,
       peer_version: peer_version,
       inv_hash: inv_hash,
-      ping_nonce: ping_nonce
+      ping_nonce: ping_nonce,
+      linger: linger
     }
 
     pid = spawn_link(fn -> accept(listen, script) end)
@@ -82,10 +87,10 @@ defmodule Athanor.P2P.FakePeerServer do
     %{progress | payload?: true}
   end
 
-  # The client answered our ping: report it and close the connection.
+  # The client answered our ping: report it and (unless lingering) close.
   defp react(%Frame{command: "pong", payload: <<nonce::little-64>>}, sock, progress, script) do
     send(script.report_to, {:server_received, :pong, nonce})
-    :gen_tcp.close(sock)
+    unless script.linger, do: :gen_tcp.close(sock)
     progress
   end
 

@@ -22,7 +22,8 @@ defmodule Athanor.P2P.PeerPool do
 
   use GenServer
 
-  alias Athanor.P2P.{Discovery, Peer, PeerRegistry}
+  alias Athanor.P2P.{Discovery, Frame, Peer, PeerRegistry}
+  alias Athanor.P2P.Messages.Addr
   alias Athanor.P2P.PeerPool.{AddrBook, Config}
 
   @refresh_interval 30_000
@@ -84,7 +85,19 @@ defmodule Athanor.P2P.PeerPool do
     end
   end
 
-  # Application frames are ignored in this phase (addr-gossip absorption is T2.4).
+  # A peer forwarded `addr` gossip: absorb the routable addresses it advertises
+  # into the book and try to fill any open slots with the newly learned peers.
+  def handle_info({:peer, _pid, :frame, %Frame{command: "addr", payload: payload}}, state) do
+    learned =
+      case Addr.parse(payload) do
+        {:ok, entries, _rest} -> Discovery.absorb_addr(entries)
+        _ -> []
+      end
+
+    {:noreply, fill(%{state | book: AddrBook.add_candidates(state.book, learned)})}
+  end
+
+  # Any other forwarded frame is ignored by the pool (consumed by Phase 3 ingest).
   def handle_info({:peer, _pid, :frame, _frame}, state), do: {:noreply, state}
 
   def handle_info(:refresh, state) do
