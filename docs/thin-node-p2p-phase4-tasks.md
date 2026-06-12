@@ -36,7 +36,7 @@ consumer that needs `getdata` (to serve our pending tx), `inv` (to detect our tx
 > state for no gain over a list; (2) `Phoenix.PubSub` per-frame — heavier and loses the originating pid
 > cleanly. The list keeps the pool the lifecycle owner and the Phase-1 owner-message shape intact.
 
-**Live-peer seam.** The relay must announce to *N−2* live peers and know their pids. `PeerRegistry` tracks
+**Live-peer seam.** The relay must announce to a subset of live peers (the §B hold-back rule) and know their pids. `PeerRegistry` tracks
 `by_addr`/`by_pid` but exposes only `addresses/1`. Add **`PeerRegistry.pids/1`** returning the live peer
 pids (the `by_addr` values), so the relay selects announce targets without reaching into pool internals.
 
@@ -52,9 +52,10 @@ A pure reducer governs one broadcast's life with no process/IO, mirroring the Ph
 **State** (per in-flight broadcast, keyed by txid — wire/internal order, as in Phase 3):
 - `pending` — `%{txid => %{raw: payload, announced_to: MapSet(peer), relayed_back: MapSet(peer),
   first_at_ms: t}}`. `raw` is served on a matching `getdata`.
-- A broadcast is **propagated** once `relayed_back` contains **≥2 distinct peers that were NOT in
-  `announced_to`** — i.e. peers we didn't tell are now advertising it, proving the network accepted and
-  re-gossiped it. (Counting only non-targets avoids mistaking our own announce echoing.)
+- A broadcast is **propagated** once `relayed_back` contains **≥`bar` distinct peers that were NOT in
+  `announced_to`** (see the hold-back rule below for `bar`) — i.e. peers we didn't tell are now advertising
+  it, proving the network accepted and re-gossiped it. Counting **only non-targets** avoids mistaking our
+  own announce echoing; a relay-back from a peer in `announced_to` is **never** counted.
 - `ttl_ms` / `:tick` expiry: a broadcast that never reaches the propagation bar within the window is
   marked `:unconfirmed` and dropped from `pending` (the caller already has the REST/RPC fallback result).
 
@@ -62,22 +63,39 @@ A pure reducer governs one broadcast's life with no process/IO, mirroring the Ph
 
 | Event | Decision | Action(s) |
 |---|---|---|
-| `{:broadcast, txid, raw, targets}` | Record `pending[txid]` with `announced_to = targets`. | `[{:send_inv, peer, txid} for peer <- targets]` |
+| `{:broadcast, txid, raw, targets}` | Record `pending[txid]` with `announced_to = targets` (the `N − held` announce set; the caller/`TxRelay` applies the hold-back rule) and `bar`. | `[{:send_inv, peer, txid} for peer <- targets]` |
 | `{:getdata, txid, peer}` | If `pending[txid]` → serve the stored raw tx to that peer; else ignore (not ours). | `{:send_tx, peer, raw}` or none |
-| `{:inv, txid, peer}` | If `pending[txid]` and `peer ∉ announced_to` → add to `relayed_back`; on crossing **≥2** → emit `:propagated` once. | `{:propagated, txid}` or none |
+| `{:inv, txid, peer}` | If `pending[txid]` **and `peer ∉ announced_to`** → add to `relayed_back`; once `held ≥ 1` and `\|relayed_back\| ≥ bar` → emit `:propagated` once. A `peer ∈ announced_to` (target echo) is ignored. | `{:propagated, txid}` or none |
 | `{:reject, txid, peer, reason}` | Record the rejection for that txid (surfaced to the broadcast caller/audit). | `{:rejected, txid, peer, reason}` |
 | `:tick` | Drop `pending` entries older than `ttl_ms`, emitting `:unconfirmed` for each. | `[{:unconfirmed, txid}]` |
 
-- **Who we announce to:** `N−2` live peers (leave headroom; the 2 we hold back are where we *expect* the
-  relay-back from — they should learn it from the network, not from us). If fewer than 3 live peers, announce
-  to all and **lower the propagation bar to ≥1 non-target** (documented degradation, `log/0`-ged — never a
-  silent cap).
+- **Hold-back rule (announce targets + propagation `bar`).** Of `N` live peers, **hold back**
+  `held = min(2, N−1)` and **announce to the remaining `N − held`**. The held-back peers are *where we expect
+  the relay-back from* — they should learn the tx from the network, not from us — so they are the only peers
+  whose `inv` can confirm propagation. `bar = held`, and `:propagated` fires only when `held ≥ 1` **and**
+  `|relayed_back ∖ announced_to| ≥ bar`. By construction `relayed_back ∖ announced_to ⊆ held-back`, so a
+  target echo can never satisfy the bar. Concretely:
+  - **N ≥ 3** → announce to `N−2`, hold back 2, `bar = 2` (normal).
+  - **N == 2** → announce to 1, hold back 1, `bar = 1` (degraded — logged).
+  - **N == 1** → announce to the single peer, hold back 0; **propagation cannot be confirmed** (no
+    non-target can exist), so the broadcast never reaches `:propagated` and terminates at `:unconfirmed`
+    via the TTL tick. Logged — never silently claimed propagated.
+  - **N == 0** → cold start: P2P is skipped entirely, RPC/REST only (§C).
+  This keeps the core invariant in every mode: **a relay-back counts only if its peer is not in
+  `announced_to`**, and `held ≥ 1` guarantees such a peer can exist before we ever claim propagation.
 - **Idempotent propagation:** `:propagated` fires exactly once per txid (track an emitted flag).
 
-**Tests (T4.0).** Each row as a unit case over the pure reducer (inject `now_ms`): announce→inv targets;
-getdata-serves-only-ours; relayed-back-by-non-target counts, by-a-target does **not**; `:propagated` fires
-once at the 2nd distinct non-target; reject recorded; tick expires stale pending as `:unconfirmed`; the
-<3-peer degraded bar.
+**Tests (T4.0).** Each row as a unit case over the pure reducer (inject `now_ms`), asserting target vs
+non-target membership **explicitly** so a target echo can never satisfy the bar:
+- announce → `:send_inv` to exactly the `N − held` targets;
+- `getdata` serves only a pending (ours) txid, never a stranger's;
+- a relay-back from a peer **in** `announced_to` does **not** count; from a held-back peer it does;
+- **N ≥ 3 (`bar = 2`)**: `:propagated` fires once, only at the 2nd distinct *held-back* relay-back (a
+  target echo + one held-back relay-back is **not** enough);
+- **N == 2 (`bar = 1`)**: `:propagated` fires at the 1st held-back relay-back;
+- **N == 1 (`held = 0`)**: no relay-back can count → never `:propagated`; the tick expires it to
+  `:unconfirmed`;
+- `reject` recorded; tick expires stale pending as `:unconfirmed`.
 
 ---
 
@@ -116,10 +134,12 @@ fallback**, behind an injected seam so tests need no node:
 ### T4.1 — `TxRelay` GenServer — `Athanor.P2P.TxRelay`
 The thin shell: registered `frame_sink` member; on `{:peer,_,:frame,%Frame{command:"getdata"|"inv"|"reject"}}`
 folds `Tracker.step` and performs `{:send_tx,_}`/`{:send_inv,_}`/`{:propagated,_}` via `Peer.send_frame` and
-audit callbacks; `broadcast(txid, raw)` selects `N−2` targets from `PeerRegistry.pids/1` and steps
-`{:broadcast,…}`; `:tick`/TTL timers injected.
-**RED:** `tx_relay_test.exs` (fake peers + stub audit sink): broadcast → `send_inv` to N−2 captured;
-`getdata` for a pending txid → `send_tx` with the stored bytes; non-target `inv` ×2 → `:propagated` audit;
+audit callbacks; `broadcast(txid, raw)` reads `PeerRegistry.pids/1`, applies the §B hold-back rule
+(announce to `N − min(2, N−1)`, `bar = min(2, N−1)`), and steps `{:broadcast, txid, raw, targets, bar}`;
+`:tick`/TTL timers injected.
+**RED:** `tx_relay_test.exs` (fake peers + stub audit sink): broadcast → `send_inv` to the `N − held`
+announce targets captured;
+`getdata` for a pending txid → `send_tx` with the stored bytes; `bar` distinct held-back `inv`s → `:propagated` audit;
 `reject` → audit; non-pending `getdata` ignored.
 **GREEN/REFACTOR:** as above; reuse the Phase-3 `apply_actions` shape.
 
@@ -130,10 +150,13 @@ audit callbacks; `broadcast(txid, raw)` selects `N−2` targets from `PeerRegist
 **GREEN:** inject `:relay`; route by `Supervisor.enabled?/0` + `PeerRegistry.pids/1 != []`.
 
 ### T4.3 — Integration: self-broadcast round-trips (real socket) — `tx_relay/integration_test.exs` (`async: false`)
-`FakePeerServer` extended to **echo an inv back** for a tx it received via `getdata` (a non-target relaying
-our tx). End-to-end over loopback through the real `P2P.Supervisor`: `broadcast_tx` → `inv` to peers →
-server `getdata` → we serve `tx` → server (acting as a non-target) sends `inv` back → relay marks
-`:propagated` → audit row `propagated`.
+End-to-end over loopback through the real `P2P.Supervisor` with **≥3** `FakePeerServer`s so the hold-back
+rule yields real non-targets (announce to `N−2`, hold back 2). `FakePeerServer` is extended to **send an
+`inv(our_txid)` back** (simulating a peer that learned the tx from the network), configured per-server.
+`broadcast_tx` → `inv` to the announce targets → a target `getdata` → we serve `tx`; meanwhile the two
+**held-back** servers send `inv(our_txid)` → the relay counts those (and **ignores** any echo from the
+announce target) → marks `:propagated` → audit row `propagated`. The test asserts the relay-back peers were
+**not** in `announced_to` (so target echo cannot be what flips the status).
 
 ### T4.4 — Live smoke (`@tag :external`, testnet, CI-skipped) — `tx_relay/live_smoke_test.exs`
 Broadcast a real (funded) tx on testnet and assert our own txid comes back via a non-target peer within a
@@ -145,8 +168,10 @@ tx). `mix test --only external`; mainnet opt-in via `P2P_SMOKE_NETWORK=mainnet`.
 ## Definition of Done (Phase 4)
 - T4.S, T4.0–T4.3 green; `mix test test/athanor/p2p` + the broadcast tests clean (T4.4 excluded by default).
 - No `Process.sleep`/`Process.alive?`; `now_ms`/timers injected.
-- A self-broadcast tx round-trips over real sockets (seen back via a non-target peer); propagation requires
-  **≥2 distinct non-target** relays (≥1 in the documented <3-peer degraded mode, logged).
+- A self-broadcast tx round-trips over real sockets (seen back via a **held-back, non-target** peer);
+  propagation requires **≥`bar` distinct non-target** relays where `bar = held = min(2, N−1)` (2 normally,
+  1 with exactly 2 peers, and **never claimed** with 1 peer — it expires `:unconfirmed`). Tests assert the
+  relay-back peer ∉ `announced_to`, so a target echo can never flip the status.
 - Cold-start safety: with P2P primary **and zero peers**, `broadcast_tx` still works via RPC/REST fallback,
   byte-for-byte as today.
 - The §A fan-out keeps Phase 2/3 behavior unchanged for single-sink/`nil` configs; one broadcast public API.
