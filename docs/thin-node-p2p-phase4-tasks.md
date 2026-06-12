@@ -155,21 +155,35 @@ before anything async:
 - When P2P is disabled or there are **zero** live peers (cold start), behavior is **exactly today's** —
   RPC/REST only. This is the cold-start-safety rule carried from DXS; it is the headline T4.2 test.
 
+**Audit identity bridge (blocker — binary P2P txid vs text audit row).** `broadcasts.txid` stays the
+existing **display-order hex string** (`Transaction.tx_id_hex/1`) — unchanged column, backward-compatible
+return shape. `broadcast_tx/2` inserts the row keyed by `txid_hex` and hands the relay the **binary**
+`txid_bin = Transaction.txid_binary/1` (the relay/`Tracker` key on binary internally, as in Phase 3). The
+async audit callbacks (`:propagated`/`:unconfirmed`/`:rejected`) carry the **binary** txid; before touching
+the row they convert it back to display hex via the Phase-3 `display_hex/1` reversal
+(`txid_bin |> reverse-bytes |> Base.encode16(:lower)`) and look the row up by that hex key. So a binary relay
+event updates **the exact row** `broadcast_tx/2` inserted, and no 32-byte binary is ever written into the
+text column. T4.1/T4.2 assert this round-trip explicitly.
+
 **Audit status model (single `status` string column; widen `Broadcast.changeset`, no PG-enum so no
-migration — confirm in T4.2).** Statuses and the **monotonic, never-downgrading** precedence
-`pending(0) < relayed(1) < accepted(2) < propagated(3)`:
-- `pending` — row created.
-- `relayed` — announced to ≥1 peer via P2P.
-- `accepted` — the RPC/REST fallback returned ok (authoritative *single-node* acceptance). Coexists with
-  the P2P axis as a strictly-higher tier than `relayed`: a tx that is `relayed` then RPC-`accepted` ends
-  `accepted` unless it also reaches `propagated`.
-- `propagated` — ≥`bar` distinct non-target peers re-announced it (network-level acceptance; the ceiling).
-- `unconfirmed` — set **only** by the TTL tick on a row still `< accepted` (neither node-accepted nor
-  propagated); it never overrides `accepted`/`propagated`.
-- `rejected` — a node/peer refusal (RPC error, or a P2P `reject`) on a row still `< accepted`.
-Cold-start (no P2P) collapses to exactly today's `pending → accepted | rejected`. Propagation is
-asynchronous: `broadcast_tx/2` returns after recording + handing off; `:propagated`/`:unconfirmed`/
-`:rejected` update the row out of band under this precedence (a transition never lowers the tier).
+migration — confirm in T4.2).** The complete **monotonic, never-downgrading lattice** — `advance_status/2`
+sets `status` to the higher-ranked of the current and incoming value, never the lower:
+
+| rank | status | set by |
+|---|---|---|
+| 0 | `pending` | row created |
+| 1 | `relayed` | announced to ≥1 peer via P2P |
+| 2 | `unconfirmed` | TTL tick with no propagation |
+| 3 | `rejected` | a node RPC error **or** a P2P peer `reject` |
+| 4 | `accepted` | the RPC/REST `:broadcaster` returned ok (authoritative single-node acceptance) |
+| 5 | `propagated` | ≥`bar` distinct non-target peers re-announced it (network acceptance; the ceiling) |
+
+This resolves the two terminal-below-accepted cases deterministically: **`rejected` (3) outranks
+`unconfirmed` (2)**, so a late peer/RPC `reject` **does** overwrite an `unconfirmed` row (more informative),
+while a TTL `:unconfirmed` **never** overwrites an existing `rejected` (or `accepted`/`propagated`). A node
+`accepted` (4) outranks a single peer's `rejected` (3). `accepted`/`propagated` are never downgraded.
+Cold-start (no P2P) collapses to exactly today's `pending → accepted | rejected`. Updates are out-of-band:
+`broadcast_tx/2` returns after recording + handing off; async events apply via `advance_status/2`.
 
 **`matches?`-style single authority:** there is one broadcast entry point (`broadcast_tx/2`); P2P vs RPC is a
 *routing* decision inside it, not a second public API.
@@ -219,9 +233,14 @@ T4.2 must confirm this** (a `mix ecto` check); add one only if the column is con
   relay invoked but `:broadcaster` **not** called;
 - **P2P disabled / zero peers → RPC-only, row exactly as today** (cold-start safety), via the default
   `:broadcaster` (`&RpcClient.send_raw_transaction/1`);
-- **precedence (monotonic, never downgrades):** a `relayed` row that the RPC fallback then accepts ends
-  `accepted`; a later `:propagated` lifts it to `propagated`; a TTL `:unconfirmed` does **not** override an
-  `accepted`/`propagated` row; a `:propagated`/`:unconfirmed`/`:rejected` event applies via the precedence;
+- **lattice precedence (monotonic, never downgrades)** — `pending<relayed<unconfirmed<rejected<accepted<propagated`:
+  `relayed` + RPC-accept → `accepted`; later `:propagated` → `propagated`; **reject-then-TTL**: a `rejected`
+  row is **not** overwritten by a TTL `:unconfirmed`; **TTL-then-reject**: an `unconfirmed` row **is**
+  overwritten by a later `:reject` (rank 3 > 2); a single peer `reject` does **not** override `accepted`;
+  `accepted`/`propagated` are never downgraded;
+- **audit identity bridge:** a **binary**-keyed `:propagated` (and `:unconfirmed`/`:rejected`) event updates
+  the **exact** row `broadcast_tx/2` inserted (keyed by display-hex), and the row's `txid` stays display-hex
+  (backward-compatible); no 32-byte binary is written to the text column;
 - **invalid `raw`** → row `rejected` with `error: "invalid raw transaction"`, **no** `inv`, **no** RPC call.
 **GREEN:** widen the changeset; inject `:relay`; route by `Supervisor.enabled?/0` + `PeerRegistry.pids/1 != []`;
 apply the status precedence in one place (a `Broadcast.advance_status/2`-style helper) so out-of-band events
@@ -275,10 +294,12 @@ tx). `mix test --only external`; mainnet opt-in via `P2P_SMOKE_NETWORK=mainnet`.
   stub that flunks if called) and asserts it is **never called**, so `:propagated` is proven via the P2P
   announce→non-target-relay-back path, not the node path. Any peer ∉ `announced_to` counts (hold-back only
   guarantees ≥`bar` non-targets exist).
-- **Audit status contract:** `Broadcast.changeset/2` accepts `pending|relayed|propagated|unconfirmed|
-  accepted|rejected`, all persisting; transitions follow the monotonic precedence
-  `pending<relayed<accepted<propagated` (with `unconfirmed`/`rejected` only below `accepted`); no migration
-  required (string column — confirmed in T4.2).
+- **Audit status contract:** `Broadcast.changeset/2` accepts `pending|relayed|unconfirmed|rejected|accepted|
+  propagated`, all persisting; `advance_status/2` follows the monotonic lattice
+  `pending(0)<relayed(1)<unconfirmed(2)<rejected(3)<accepted(4)<propagated(5)`, never downgrading
+  (reject-then-TTL keeps `rejected`; TTL-then-reject becomes `rejected`); no migration (string column —
+  confirmed in T4.2). The audit row's `txid` stays display-order hex; binary relay events are converted via
+  `display_hex/1` before row lookup, so they update the exact `broadcast_tx/2` row (asserted).
 - Format clean under Elixir 1.15; app code clean under `mix compile --warnings-as-errors`.
 
 ---
