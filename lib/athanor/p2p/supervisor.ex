@@ -2,16 +2,19 @@ defmodule Athanor.P2P.Supervisor do
   @moduledoc """
   Supervises the P2P peer pool (Phase 2, T2.5).
 
-  Owns three children under `:rest_for_one`:
+  Owns four children under `:rest_for_one`:
 
     1. `Athanor.P2P.PeerRegistry` (the live-peer view), then
-    2. `Athanor.P2P.MempoolObserver` (Phase 3 §C — the pool's `frame_sink`), then
-    3. `Athanor.P2P.PeerPool` (the dialer), with `frame_sink` set to the
-       observer's registered name so forwarded frames reach it.
+    2. `Athanor.P2P.MempoolObserver` (Phase 3 §C — inbound mempool ingest), then
+    3. `Athanor.P2P.TxRelay` (Phase 4 §A — outbound broadcast + relay-back), then
+    4. `Athanor.P2P.PeerPool` (the dialer), with `frame_sink` set to the
+       **fan-out list** `[MempoolObserver, TxRelay]` so each forwarded frame
+       reaches both consumers (the observer cares about `inv`/`tx`/`notfound`;
+       the relay about `getdata`/`inv`/`reject`).
 
-  `:rest_for_one` is deliberate and ordered: the observer's name must be
-  registered before the pool forwards frames to it; a registry restart cascades
-  to both; a pool crash leaves the registry and observer intact.
+  `:rest_for_one` is deliberate and ordered: both sink names must be registered
+  before the pool forwards frames to them; a registry restart cascades to all;
+  a pool crash leaves the registry, observer, and relay intact.
 
   This supervisor is **config-gated and off by default** (per the plan, P2P is
   disabled until soak-tested). It runs as a *sibling* of the existing runtime
@@ -24,8 +27,13 @@ defmodule Athanor.P2P.Supervisor do
   use Supervisor
   require Logger
 
-  alias Athanor.P2P.{MempoolObserver, Network, PeerPool, PeerRegistry, Watchlist}
+  alias Athanor.P2P.{MempoolObserver, Network, PeerPool, PeerRegistry, TxRelay, Watchlist}
   alias Athanor.P2P.Messages.Version
+  alias Athanor.Services.Broadcast
+
+  # The pool's frame_sink fan-out (§A): every post-handshake frame reaches both
+  # the inbound observer and the outbound relay.
+  @frame_sinks [MempoolObserver, TxRelay]
 
   # Application-env key for the P2P stack: `config :athanor, Athanor.P2P, ...`.
   @config_key Athanor.P2P
@@ -43,22 +51,28 @@ defmodule Athanor.P2P.Supervisor do
   def init(opts) do
     pool_config = Keyword.get(opts, :pool_config) || runtime_pool_config()
 
-    # The observer is the pool's frame sink (§C). Default the sink to the
-    # observer's registered name (so the wiring survives an observer restart),
-    # while honouring an explicitly-supplied sink.
-    pool_config = %{pool_config | frame_sink: pool_config.frame_sink || MempoolObserver}
+    # The pool fans each frame out to the [observer, relay] list (§A). Default
+    # the sink to the registered sink names (so the wiring survives a child
+    # restart), while honouring an explicitly-supplied sink.
+    pool_config = %{pool_config | frame_sink: pool_config.frame_sink || @frame_sinks}
 
     observer_opts =
       opts
       |> Keyword.get(:observer_opts, default_observer_opts())
       |> Keyword.put_new(:name, MempoolObserver)
 
-    # `:rest_for_one`, ordered Registry → Observer → Pool: the observer's name
-    # must be registered before the pool starts forwarding frames to it, and a
-    # registry restart cascades to both.
+    relay_opts =
+      opts
+      |> Keyword.get(:relay_opts, default_relay_opts())
+      |> Keyword.put_new(:name, TxRelay)
+
+    # `:rest_for_one`, ordered Registry → Observer → TxRelay → Pool: both sink
+    # names must be registered before the pool starts forwarding frames to them,
+    # and a registry restart cascades to all.
     children = [
       {PeerRegistry, [name: PeerRegistry]},
       {MempoolObserver, observer_opts},
+      {TxRelay, relay_opts},
       {PeerPool, pool_config}
     ]
 
@@ -83,7 +97,7 @@ defmodule Athanor.P2P.Supervisor do
       network: network,
       target: Keyword.get(env, :target, 8),
       our_version: default_version(),
-      frame_sink: MempoolObserver
+      frame_sink: @frame_sinks
     }
   end
 
@@ -91,6 +105,11 @@ defmodule Athanor.P2P.Supervisor do
   # from the persisted `WatchingAddress` set; the matcher (`matches?/1`) and the
   # indexing pipeline use their production defaults.
   defp default_observer_opts, do: [watchlist: build_watchlist()]
+
+  # Relay options for the supervised child. The audit sink bridges relay
+  # lifecycle events back to the `broadcasts` audit rows (§C); target selection
+  # and TTL/cap use their production defaults.
+  defp default_relay_opts, do: [audit: &Broadcast.apply_relay_event/1]
 
   # Seed a `Watchlist` from the watched-address table. Wrapped defensively: a
   # transient DB unavailability at P2P start (P2P is enabled post-boot) must not

@@ -11,7 +11,7 @@ defmodule Athanor.P2P.SupervisorTest do
   """
   use ExUnit.Case, async: false
 
-  alias Athanor.P2P.{Frame, MempoolObserver, Network, PeerPool, PeerRegistry, Watchlist}
+  alias Athanor.P2P.{Frame, MempoolObserver, Network, PeerPool, PeerRegistry, TxRelay, Watchlist}
   alias Athanor.P2P.Messages.{Inv, Version}
 
   defp ver do
@@ -137,8 +137,36 @@ defmodule Athanor.P2P.SupervisorTest do
     assert payload == Inv.serialize([{:tx, txid}])
   end
 
-  test "runtime_pool_config wires the observer name as the frame_sink" do
-    assert Athanor.P2P.Supervisor.runtime_pool_config().frame_sink == MempoolObserver
+  test "runtime_pool_config wires the frame_sink as the [observer, relay] fan-out (Phase 4 §A)" do
+    assert Athanor.P2P.Supervisor.runtime_pool_config().frame_sink == [MempoolObserver, TxRelay]
+  end
+
+  ## ── Phase 4: TxRelay wiring (§A fan-out) ──
+
+  test "starts the TxRelay under the tree, registered under its name, after the observer" do
+    sup = start_supervised!({Athanor.P2P.Supervisor, [pool_config: fake_config()]})
+
+    ids = Supervisor.which_children(sup) |> Enum.map(&elem(&1, 0))
+    assert TxRelay in ids
+    assert is_pid(Process.whereis(TxRelay))
+
+    # rest_for_one order: Registry → Observer → TxRelay → Pool, so both sink
+    # names are registered before the pool starts forwarding frames to them.
+    order = Supervisor.which_children(sup) |> Enum.map(&elem(&1, 0)) |> Enum.reverse()
+
+    assert Enum.find_index(order, &(&1 == MempoolObserver)) <
+             Enum.find_index(order, &(&1 == TxRelay))
+
+    assert Enum.find_index(order, &(&1 == TxRelay)) < Enum.find_index(order, &(&1 == PeerPool))
+  end
+
+  test "the default frame_sink fans out to both the observer and the relay" do
+    sup = start_supervised!({Athanor.P2P.Supervisor, [pool_config: fake_config()]})
+
+    assert :sys.get_state(child_pid(sup, PeerPool)).config.frame_sink == [
+             MempoolObserver,
+             TxRelay
+           ]
   end
 
   test "an explicit frame_sink in the pool_config is preserved" do
