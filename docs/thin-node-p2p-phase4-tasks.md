@@ -330,8 +330,9 @@ tx). `mix test --only external`; mainnet opt-in via `P2P_SMOKE_NETWORK=mainnet`.
   `txid = Transaction.txid_binary/1` (wire/internal order) and binary `raw_bin = Transaction.to_binary/1`; the
   relay announces `inv({:tx, txid})` and serves `raw_bin` (binary wire bytes, never ASCII hex). Validation is
   upstream: invalid hex/unparseable tx → row `rejected` (`error: "invalid raw transaction"`) with **no** relay,
-  **no** `inv`, **no** RPC call — tested for valid and invalid input. The relay seam `(txid, raw_bin -> :ok)`
-  is fire-and-forget (never returns a parse error).
+  **no** `inv`, **no** RPC call — tested for valid and invalid input. The relay seam
+  `(txid, raw_bin -> :ok | {:error, :saturated})` is a synchronous enqueue whose only error is `:saturated`
+  (validation is upstream, so it never sees invalid/oversized input).
 - **Fallback control contract:** `:rpc_fallback?` (default `true`; config `rpc_fallback`) gates the
   *post-relay* belt-and-suspenders `:broadcaster` call only — the cold-start path always calls it. T4.2
   asserts default-`true` calls `:broadcaster` on the live-peer path and `false` skips it; T4.3 sets `false`.
