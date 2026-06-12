@@ -49,7 +49,9 @@ defmodule Athanor.Workers.MissingTxSyncer do
           check_and_backfill(txids)
 
         {:error, reason} ->
-          Logger.debug("MissingTxSyncer: failed to fetch history for #{wa.address}: #{inspect(reason)}")
+          Logger.debug(
+            "MissingTxSyncer: failed to fetch history for #{wa.address}: #{inspect(reason)}"
+          )
       end
     end)
   end
@@ -66,7 +68,9 @@ defmodule Athanor.Workers.MissingTxSyncer do
               {:ok, raw_hex} ->
                 case Base.decode16(raw_hex, case: :mixed) do
                   {:ok, raw_binary} ->
-                    TransactionFilter.process_raw_tx(raw_binary)
+                    # Source-tag the observation (Phase 3 §A): this backfill path
+                    # fetches the raw tx from WhatsOnChain → `:whatsonchain`.
+                    TransactionFilter.process_raw_tx(raw_binary, :whatsonchain)
 
                   :error ->
                     :ok

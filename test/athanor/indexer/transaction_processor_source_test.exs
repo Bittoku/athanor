@@ -173,4 +173,20 @@ defmodule Athanor.Indexer.TransactionProcessorSourceTest do
     # And the flags were genuinely recomputed (no longer deferred).
     assert waiter_meta.metadata["all_stas_inputs_known"] == true
   end
+
+  # !11 review blocker (note 760): existing non-P2P ingress paths must record
+  # their concrete source, not the `:unknown` back-compat default. The block
+  # processor indexes via `process_tx/4` with `:block` (the other ingress paths
+  # — ZMQ `:zmq`, JungleBus `:junglebus`, backfill `:whatsonchain` — thread the
+  # source through the structurally identical `process_raw_tx/2 → :index_tx`
+  # cast; `:junglebus` is covered by the union test above).
+  test "the block-processor path records :block" do
+    pkh = :binary.copy(<<0x49>>, 20)
+    address = BSV.Base58.check_encode(pkh, 0x00)
+    tx = p2pkh_tx(pkh)
+
+    TransactionProcessor.process_tx(tx, [address], [], :block)
+
+    assert meta_for(tx).metadata["sources"] == ["block"]
+  end
 end

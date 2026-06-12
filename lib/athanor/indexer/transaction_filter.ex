@@ -82,6 +82,9 @@ defmodule Athanor.Indexer.TransactionFilter do
 
   ## Parameters
     - `raw_tx_binary` — raw transaction bytes
+    - `source` — observation provider, threaded into
+      `MetaTransaction.metadata["sources"]` (`:zmq | :junglebus | :whatsonchain
+      | :p2p | :block | :unknown`). Defaults to `:unknown`.
 
   ## Returns
     :ok

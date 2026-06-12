@@ -71,7 +71,10 @@ defmodule Athanor.Blockchain.ZmqListener do
     # Kick off async connection
     send(self(), :connect)
 
-    Logger.info("ZmqListener initialized, rawtx=#{raw_tx_endpoint}, hashblock=#{hash_block_endpoint}")
+    Logger.info(
+      "ZmqListener initialized, rawtx=#{raw_tx_endpoint}, hashblock=#{hash_block_endpoint}"
+    )
+
     {:ok, state}
   end
 
@@ -83,7 +86,10 @@ defmodule Athanor.Blockchain.ZmqListener do
         {:noreply, %{state | connected: true}}
 
       {:error, reason} ->
-        Logger.warning("ZmqListener connection failed: #{inspect(reason)}, retrying in #{@reconnect_delay_ms}ms")
+        Logger.warning(
+          "ZmqListener connection failed: #{inspect(reason)}, retrying in #{@reconnect_delay_ms}ms"
+        )
+
         schedule_reconnect()
         {:noreply, %{state | connected: false}}
     end
@@ -93,7 +99,8 @@ defmodule Athanor.Blockchain.ZmqListener do
   # Chumak delivers multipart messages as a list: [topic, payload, sequence_number].
   def handle_info({:zmq, _socket, [<<"rawtx", _::binary>>, payload | _rest], _opts}, state) do
     Logger.debug("ZmqListener received rawtx (#{byte_size(payload)} bytes)")
-    GenServer.cast(Athanor.Indexer.TransactionFilter, {:process_raw_tx, payload})
+    # Source-tag the observation (Phase 3 §A): ZMQ rawtx → `:zmq`.
+    GenServer.cast(Athanor.Indexer.TransactionFilter, {:process_raw_tx, payload, :zmq})
     {:noreply, state}
   end
 

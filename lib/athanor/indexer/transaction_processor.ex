@@ -27,8 +27,8 @@ defmodule Athanor.Indexer.TransactionProcessor do
 
   @doc """
   Synchronously process a transaction (for block processing). `source` tags the
-  observation's provider (`:p2p | :zmq | :junglebus | :bitails | :block |
-  :unknown`); it is recorded in `MetaTransaction.metadata["sources"]`.
+  observation's provider (`:p2p | :zmq | :junglebus | :whatsonchain | :bitails |
+  :block | :unknown`); it is recorded in `MetaTransaction.metadata["sources"]`.
   """
   def process_tx(tx, matched_addresses, matched_tokens, source \\ :unknown) do
     GenServer.call(
