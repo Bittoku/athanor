@@ -168,7 +168,8 @@ defmodule Athanor.Blockchain.ZmqListener do
          {hashblock_host, hashblock_port} <- parse_endpoint(state.hash_block_endpoint),
          {:ok, _} <- :chumak.connect(state.rawtx_socket, :tcp, rawtx_host, rawtx_port),
          :ok <- :chumak.subscribe(state.rawtx_socket, "rawtx"),
-         {:ok, _} <- :chumak.connect(state.hashblock_socket, :tcp, hashblock_host, hashblock_port),
+         {:ok, _} <-
+           :chumak.connect(state.hashblock_socket, :tcp, hashblock_host, hashblock_port),
          :ok <- :chumak.subscribe(state.hashblock_socket, "hashblock") do
       {:ok, state}
     else
