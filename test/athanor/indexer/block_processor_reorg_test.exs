@@ -193,6 +193,100 @@ defmodule Athanor.Indexer.BlockProcessorReorgTest do
     assert BlockProcessor.last_processed_height() == 100
   end
 
+  # Hermes !18 note 945 B3: no-gap connect + predecessor guard.
+  test "connect_branch halts at the first failed connect and does not process later blocks" do
+    state = %{last_height: 100, processing: false}
+
+    process_fun = fn
+      <<0xAA, _::binary>>, _acc ->
+        {:ok, 101}
+
+      <<0xBB, _::binary>>, _acc ->
+        {:error, :boom}
+
+      <<0xCC, _::binary>>, _acc ->
+        flunk("must not process a block after an earlier connect failed")
+    end
+
+    result =
+      BlockProcessor.connect_branch(
+        [
+          <<0xAA, 0::248>>,
+          <<0xBB, 0::248>>,
+          <<0xCC, 0::248>>
+        ],
+        state,
+        process_fun
+      )
+
+    # Advanced to the last contiguous success (101), then halted before 0xCC.
+    assert result.last_height == 101
+  end
+
+  test "connect_branch with a failing first block keeps last_height unchanged" do
+    state = %{last_height: 100, processing: false}
+
+    process_fun = fn
+      <<0xFA, _::binary>>, _acc ->
+        {:error, :boom}
+
+      <<0x5C, _::binary>>, _acc ->
+        flunk("succeeding block must not run after the earlier failure")
+    end
+
+    result =
+      BlockProcessor.connect_branch([<<0xFA, 0::248>>, <<0x5C, 0::248>>], state, process_fun)
+
+    assert result.last_height == 100
+  end
+
+  test "maybe_handle_reorg refuses a non-genesis block whose predecessor context is missing" do
+    {:ok, _} =
+      %BlockProcessContext{}
+      |> BlockProcessContext.changeset(%{
+        id: "h100",
+        height: 100,
+        processed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      })
+      |> Repo.insert()
+
+    # A block at 105 (predecessor 104 absent) while the index is non-empty → gap.
+    assert {:error, :missing_predecessor} = BlockProcessor.maybe_handle_reorg("h104", 105)
+  end
+
+  test "maybe_handle_reorg allows the first block of an empty index (no predecessor expected)" do
+    assert :ok = BlockProcessor.maybe_handle_reorg("genesis_prev", 1)
+  end
+
+  test "maybe_handle_reorg is :ok when the predecessor context matches" do
+    {:ok, _} =
+      %BlockProcessContext{}
+      |> BlockProcessContext.changeset(%{
+        id: "h100",
+        height: 100,
+        processed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      })
+      |> Repo.insert()
+
+    assert :ok = BlockProcessor.maybe_handle_reorg("h100", 101)
+  end
+
+  test "maybe_handle_reorg rolls back (and is :ok) on a predecessor hash mismatch" do
+    {:ok, _} =
+      %BlockProcessContext{}
+      |> BlockProcessContext.changeset(%{
+        id: "h100",
+        height: 100,
+        processed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      })
+      |> Repo.insert()
+
+    # Block at 101 claims a different parent than our stored height-100 context.
+    assert :ok = BlockProcessor.maybe_handle_reorg("not-h100", 101)
+    # Rolled back below 100 → the stored context is gone.
+    assert is_nil(Repo.get(BlockProcessContext, "h100"))
+  end
+
   test "rollback leaves a UTXO spent by a non-orphaned tx alone" do
     deep_txid = :crypto.strong_rand_bytes(32)
     spender_txid = :crypto.strong_rand_bytes(32)

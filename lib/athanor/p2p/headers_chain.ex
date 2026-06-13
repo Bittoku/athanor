@@ -57,6 +57,15 @@ defmodule Athanor.P2P.HeadersChain do
     GenServer.start_link(__MODULE__, opts, if(name, do: [name: name], else: []))
   end
 
+  @doc """
+  The height of the chain's window root (the synthetic seed height), or `nil` if
+  the chain is not yet seeded. The `ChainTipVerifier` uses this to keep RPC
+  catch-up active until the local index has reached the P2P seed (Hermes !18 note
+  945 B1) before deferring tip authority to P2P.
+  """
+  @spec root_height(GenServer.server()) :: non_neg_integer() | nil
+  def root_height(server \\ __MODULE__), do: GenServer.call(server, :root_height)
+
   ## ── Server callbacks ──
 
   @impl true
@@ -81,6 +90,12 @@ defmodule Athanor.P2P.HeadersChain do
     schedule_tick(state.tick_interval_ms)
     {:ok, ensure_seeded(state)}
   end
+
+  @impl true
+  def handle_call(:root_height, _from, %{tree: nil} = state), do: {:reply, nil, state}
+
+  def handle_call(:root_height, _from, %{tree: tree} = state),
+    do: {:reply, Tree.root_height(tree), state}
 
   @impl true
   def handle_info({:peer, pid, :frame, %Frame{command: "inv", payload: payload}}, state) do

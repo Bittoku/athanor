@@ -23,7 +23,7 @@ defmodule Athanor.Workers.ChainTipVerifier do
   alias Athanor.Schema.BlockProcessContext
   alias Athanor.Blockchain.RpcClient
   alias Athanor.Indexer.BlockProcessor
-  alias Athanor.P2P.SourceRouter
+  alias Athanor.P2P.{HeadersChain, SourceRouter}
   import Ecto.Query
 
   @check_interval :timer.minutes(2)
@@ -174,6 +174,23 @@ defmodule Athanor.Workers.ChainTipVerifier do
     not suspended? and chain_tip_p2p_active?(opts)
   end
 
+  @doc """
+  Whether the RPC poll should hand tip authority to P2P this cycle. In addition to
+  `should_defer_to_p2p?/2` (P2P live + not suspended), the local index must have
+  **caught up to the P2P seed/root height** (`p2p_root_height`) — otherwise there is
+  a local→seed gap that only the RPC catch-up path fills, and deferring would let
+  P2P extend above an unprocessed gap (Hermes !18 note 945 B1). `nil`
+  `p2p_root_height` (chain unseeded) → never defer.
+  """
+  @spec defer_to_p2p?(boolean(), non_neg_integer(), non_neg_integer() | nil, keyword()) ::
+          boolean()
+  def defer_to_p2p?(suspended?, local_height, p2p_root_height, opts \\ []) do
+    should_defer_to_p2p?(suspended?, opts) and caught_up_to_seed?(local_height, p2p_root_height)
+  end
+
+  defp caught_up_to_seed?(_local_height, nil), do: false
+  defp caught_up_to_seed?(local_height, root_height), do: local_height >= root_height
+
   ## ── Private ──
 
   defp enqueue_blocks(hashes, opts) do
@@ -221,9 +238,10 @@ defmodule Athanor.Workers.ChainTipVerifier do
     with {:ok, node_height} <- RpcClient.get_block_count() do
       local_height = local_tip_height()
 
-      if should_defer_to_p2p?(state.p2p_authority_suspended) do
-        # P2P is the active tip authority and already driving catch-up via
-        # `apply_tip_event/1`; the RPC poll stays a passive consistency check.
+      if defer_to_p2p?(state.p2p_authority_suspended, local_height, p2p_root_height()) do
+        # P2P is the active tip authority and the local index has reached the P2P
+        # seed, so P2P is already driving catch-up via `apply_tip_event/1`; the RPC
+        # poll stays a passive consistency check.
         Logger.debug("ChainTipVerifier: P2P is the active tip authority; RPC poll passive")
         %{state | consecutive_synced: 0}
       else
@@ -427,5 +445,17 @@ defmodule Athanor.Workers.ChainTipVerifier do
       {:ok, hex} -> String.downcase(hex)
       {:error, _reason} -> nil
     end
+  end
+
+  # The P2P chain's seed/root height, or `nil` if unseeded/unavailable. Wrapped
+  # fail-closed (Phase-5 consistency): a `HeadersChain` that is absent/restarting
+  # makes the call exit; treat that as "no P2P window" so the poll keeps RPC
+  # authority rather than crashing or wrongly deferring.
+  defp p2p_root_height do
+    HeadersChain.root_height()
+  rescue
+    _ -> nil
+  catch
+    :exit, _ -> nil
   end
 end

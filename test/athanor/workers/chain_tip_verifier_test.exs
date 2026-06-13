@@ -149,6 +149,26 @@ defmodule Athanor.Workers.ChainTipVerifierTest do
       refute ChainTipVerifier.should_defer_to_p2p?(true, p2p_available?: true)
       refute ChainTipVerifier.should_defer_to_p2p?(false, p2p_available?: false)
     end
+
+    # Hermes !18 note 945 B1: the RPC poll must keep catching up the local→seed gap
+    # before it hands authority to P2P.
+    test "defer_to_p2p?/4 does NOT defer until the local index reaches the P2P seed/root height" do
+      # P2P active + not suspended, but local height below the P2P root → RPC stays
+      # the authority and keeps catching up the gap.
+      refute ChainTipVerifier.defer_to_p2p?(false, 90, 100, p2p_available?: true)
+      # Caught up to (or past) the seed → defer to P2P.
+      assert ChainTipVerifier.defer_to_p2p?(false, 100, 100, p2p_available?: true)
+      assert ChainTipVerifier.defer_to_p2p?(false, 150, 100, p2p_available?: true)
+    end
+
+    test "defer_to_p2p?/4 does not defer when the P2P chain is unseeded (root height unknown)" do
+      refute ChainTipVerifier.defer_to_p2p?(false, 100, nil, p2p_available?: true)
+    end
+
+    test "defer_to_p2p?/4 still respects suspension and availability" do
+      refute ChainTipVerifier.defer_to_p2p?(true, 150, 100, p2p_available?: true)
+      refute ChainTipVerifier.defer_to_p2p?(false, 150, 100, p2p_available?: false)
+    end
   end
 
   # Hermes !18 note 937: when RPC is the active tip authority it must reconcile by

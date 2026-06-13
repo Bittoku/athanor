@@ -62,6 +62,10 @@ defmodule Athanor.P2P.HeadersChain.Tree do
     }
   end
 
+  @doc "The height of the window's low edge (the synthetic root / seed height)."
+  @spec root_height(t()) :: non_neg_integer()
+  def root_height(%__MODULE__{root: root, nodes: nodes}), do: nodes[root].height
+
   @doc "Advances the tree by one event. See the module doc."
   @spec step(t(), {:connect, [BlockHeader.t()]} | {:locator, pos_integer()} | :tick | :prune) ::
           {t(), [tuple()]}
