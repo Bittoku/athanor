@@ -82,7 +82,7 @@ the trust floor that makes cumulative-work comparison safe against cheap forgery
 |---|---|---|
 | `{:connect, headers}` (an ordered list from `headers` msg) | For each header in order: let `parent = BlockHeader.prev_hash_wire(header)` (the raw wire-order `prev_block`). If `parent ∈ nodes` **and** PoW valid → add node keyed by `BlockHeader.hash/1` with `prev = parent`, `height = nodes[parent].height+1`, `cum_work` computed; if `parent ∉ nodes` → **detached**, drop it and emit `{:detached, count}` (see below); a header already present is ignored (idempotent); a PoW-invalid header is rejected. After connecting, recompute `tip = argmax cum_work`. If `tip` changed and the new tip is **not** a descendant of the old tip → a **reorg**: walk both tips back (via each node's wire-order `prev`) to the common ancestor; emit `{:reorg, %{orphan: [old-branch hashes tip→fork, exclusive of fork], connect: [new-branch hashes fork→new-tip]}}`. If the new tip simply extends the old tip → emit `{:extend, [new hashes]}`. | `{:extend, hashes}` \| `{:reorg, %{orphan, connect}}` \| `{:detached, count}` \| none |
 | `{:locator, n}` | Produce a block **locator** (the getheaders request input): `n` (default ≤ 32) hashes from `tip` backwards with exponential step-back (1,1,2,4,8,…) plus `root`, wire order, for `Messages.Headers.serialize_get_headers/3`. | `{:locator, [wire_hash]}` |
-| `:prune` | Drop nodes whose `height < tip.height − window` **and** that are not on the active tip's path, advancing `root`. | none |
+| `:prune` | Drop **every** node — active-path or fork — whose `height < tip.height − window`, and set `root` to the active-path node at `height = tip.height − window` (or the lowest retained active node if shallower). This bounds the tree to ~`window` active-path nodes plus the bounded set of in-window fork nodes; the active spine is **not** retained forever. | none |
 
 - **Detached headers** (parent not in the window) — **single policy: drop-and-re-request.** A header whose
   raw `prev_block` is not a known node is **dropped** by the reducer (it emits `{:detached, count}` for
@@ -93,13 +93,22 @@ the trust floor that makes cumulative-work comparison safe against cheap forgery
   header is the signal "my locator was stale", handled by re-requesting, not by buffering. T6.0 asserts a
   detached header leaves the tree unchanged (no node added) and yields `{:detached, _}`; T6.2 asserts the
   shell re-issues `getheaders` on it.
-- **Deep-reorg guard (blocker — bounded window honesty).** If the common ancestor of a reorg would be **below
-  `root`** (the reorg is deeper than the retained window), the tree **cannot** compute correct orphan/connect
-  sets. It emits `{:reorg_too_deep, %{depth_exceeded: true}}` and does **not** fabricate a partial set — the
-  GenServer surfaces this as an operator **alert** and falls back to the RPC `ChainTipVerifier` (§C), matching
-  the plan's §7 "deep reorg > window → degraded state requiring operator action" rule.
-- **Idempotent / order-independent:** connecting the same header twice, or headers slightly out of order
-  within a batch, converges to the same tree (a momentarily-detached header is dropped and re-requested).
+- **Deep-reorg guard (blocker — bounded window honesty).** Any reorg the **reducer** detects is necessarily
+  *within* the window: both tips connect to in-window nodes, so their common ancestor is ≥ `root`, and the
+  reducer therefore always emits a well-formed `{:reorg, …}` — it **never** fabricates a partial set and
+  **never** itself emits `{:reorg_too_deep}`. A reorg whose fork point is **below** the retained window does
+  not reach the reducer as a reorg at all: the new branch's first header has a parent below `root`, so it
+  arrives as a **detached** header. Escalating that condition is the **GenServer's** job (§B): when successive
+  `getheaders`/`headers` rounds keep returning *only* detached headers (our best locator cannot bridge the gap)
+  for `max_detached_rounds` (default **3**) consecutive rounds, the shell concludes the fork is deeper than the
+  window and emits `{:reorg_too_deep, …}` → operator **alert** + RPC fallback (§C), per the plan §7 "deep reorg
+  > window → degraded state" rule. Keeping the reducer pure and pushing the escalation to the shell makes the
+  fail-closed path **reachable** instead of an endless re-request loop.
+- **Idempotent (within a step); order-convergent only across re-requests.** Connecting the same header twice is
+  a no-op (already present → ignored). Headers in one `headers` message arrive ancestor→descendant from a
+  locator, so the reducer connects them in a single pass. A child that arrives **before** its parent (e.g.
+  split across messages) is **dropped as detached** and only attaches after a network **re-request** —
+  convergence is across rounds, not within one reducer step (drop-only does not buffer to reorder).
 
 **Tests (T6.0).** **Byte order:** a header whose raw `prev_block` equals a stored node's `BlockHeader.hash/1`
 **connects** (parent found, node added) and is **not** classified as detached — the explicit guard against the
@@ -108,9 +117,10 @@ higher-`work` **shorter** branch overtakes a longer lower-work branch → tip sw
 a fork that switches tip → `{:reorg, %{orphan, connect}}` with the exact common-ancestor split (orphan =
 old-branch hashes above the fork, connect = new-branch hashes above the fork); a header failing PoW is
 rejected (not added, no work credited); a **detached** header (unknown raw parent) leaves the tree unchanged
-(no node added) and yields `{:detached, _}`; a reorg whose ancestor is below `root` → `{:reorg_too_deep, …}`
-(no fabricated set); `:prune` drops off-tip nodes below the window and advances `root`; `:locator` yields a
-correct exponential-step-back locator.
+(no node added) and yields `{:detached, _}` (the reducer never emits `{:reorg_too_deep}` — that escalation is
+the GenServer's, T6.2); `:prune` on a chain longer than `window` drops **every** node below `tip.height −
+window` (active-path included), bounding the node count and advancing `root` to the window's low edge;
+`:locator` yields a correct exponential-step-back locator.
 
 ---
 
@@ -130,27 +140,34 @@ The thin shell: a `frame_sink` member that drives the pure `Tree` and performs t
 - **`headers` → connect.** On `{:peer, _pid, :frame, %Frame{command: "headers"}}`, parse with
   `Messages.Headers.parse/1` (already bounded at `@max_headers = 2000`; a malformed/oversize body is dropped),
   fold `{:connect, headers}` through the `Tree`, and perform the emitted events:
-    - `{:extend, hashes}` / `{:reorg, sets}` → call the injected `:on_tip` sink (§C — feeds
-      `ChainTipVerifier`), carrying display-order hashes at the boundary.
-    - `{:reorg_too_deep, _}` → log an **alert** and signal the `:on_tip` sink to fall back to RPC.
+    - `{:extend, hashes}` / `{:reorg, sets}` → reset the consecutive-detached counter to 0, then call the
+      injected `:on_tip` sink (§C — feeds `ChainTipVerifier`), carrying display-order hashes at the boundary.
+    - `{:detached, _count}` (the run could not attach — a stale locator or a below-window fork) → **re-issue
+      `getheaders`** with the current best locator and **increment** the consecutive-detached counter. When it
+      reaches `max_detached_rounds` (default **3**), conclude the fork is deeper than the retained window:
+      log an **alert**, signal `:on_tip` to fall back to RPC (`{:reorg_too_deep, …}`), and reset the counter.
+      This is where the deep-reorg fail-closed path is actually reached (the reducer never emits it).
 - **`:tick`** → periodic `:prune` + an opportunistic `getheaders` to keep the window fresh.
 - **Fail-closed (consistent with Phase 5).** Every `PeerRegistry`/peer/seed/`on_tip` call that is a
   `GenServer.call`/external call is wrapped so a transient outage degrades (skip this round / fall back to
   RPC) rather than crashing the headers chain — `safe_*` helpers mirroring `TxRelay`/`TxFetcher`.
 
 Injected collaborators: `:seed` (REST tip), `:on_tip` (`(tip_event -> any)`), `:registry`, `:now_fun`,
-`:tick_interval_ms`, `:window`, `:selector` for which peer(s) to `getheaders` from.
+`:tick_interval_ms`, `:window`, `:max_detached_rounds` (default 3 — the deep-reorg escalation threshold),
+`:selector` for which peer(s) to `getheaders` from.
 
 **Wiring.** `HeadersChain` joins the pool fan-out as a `frame_sink` member alongside the observer, relay, and
 fetcher: `frame_sink: [MempoolObserver, TxRelay, TxFetcher, HeadersChain]`, supervised under the existing
 `:rest_for_one` tree (Registry → … → HeadersChain → Pool). It acts only on `inv(MSG_BLOCK)`/`headers`,
 ignoring everything else (disjoint from the other sinks).
 
-**Tests (T6.1/T6.2).** Reducer (T6.1) is §A. GenServer (T6.2, real `Peer`s over `Transport.Fake`):
-`inv(MSG_BLOCK)` → a `getheaders` with a correct locator reaches the peer; a `headers` response advances the
-tip and calls `:on_tip` with `{:extend, …}`; a fork `headers` calls `:on_tip` with `{:reorg, …}`; an
-over-deep reorg calls `:on_tip` with the RPC-fallback signal + logs; a malformed `headers` body is dropped;
-the seed seam plants the initial tip; getheaders is de-duplicated under an inv flood.
+**Tests (T6.2).** (The pure reducer is T6.0/§A; the bits→work helper is T6.1.) GenServer (T6.2, real `Peer`s
+over `Transport.Fake`): `inv(MSG_BLOCK)` → a `getheaders` with a correct locator reaches the peer; a `headers`
+response advances the tip and calls `:on_tip` with `{:extend, …}`; an in-window fork `headers` calls `:on_tip`
+with `{:reorg, …}`; a **detached** `headers` run → the shell **re-issues `getheaders`** (assert the second
+getheaders on the wire) and, after `max_detached_rounds` consecutive detached rounds, calls `:on_tip` with the
+`{:reorg_too_deep}` RPC-fallback signal + logs an alert; a malformed `headers` body is dropped; the seed seam
+plants the initial tip; getheaders is de-duplicated under an inv flood; registry/seed exit is fail-safe.
 
 ---
 
