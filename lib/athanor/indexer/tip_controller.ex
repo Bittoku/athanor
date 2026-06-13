@@ -37,7 +37,7 @@ defmodule Athanor.Indexer.TipController do
   require Logger
 
   alias Athanor.Blockchain.RpcClient
-  alias Athanor.Indexer.{BlockProcessor, Reconcile}
+  alias Athanor.Indexer.{BlockProcessor, Bootstrap, Reconcile}
   alias Athanor.Indexer.TipController.Machine
   alias Athanor.Repo
   alias Athanor.Schema.BlockProcessContext
@@ -82,13 +82,38 @@ defmodule Athanor.Indexer.TipController do
       local_height: Keyword.get(opts, :local_height, &default_local_height/0),
       local_hash_at: Keyword.get(opts, :local_hash_at, &default_local_hash_at/1),
       apply_fun: Keyword.get(opts, :apply_fun, &BlockProcessor.apply_branch/2),
+      anchor_fun: Keyword.get(opts, :anchor_fun, &BlockProcessor.record_bootstrap_anchor/3),
+      bootstrap_fetch: Keyword.get(opts, :bootstrap_fetch, &Bootstrap.fetch/0),
+      bootstrap_ensure: Keyword.get(opts, :bootstrap_ensure, &Bootstrap.ensure/2),
       processor: Keyword.get(opts, :processor, BlockProcessor),
       batch: Keyword.get(opts, :batch, 10),
-      tick_interval_ms: Keyword.get(opts, :tick_interval_ms, :timer.minutes(2))
+      tick_interval_ms: Keyword.get(opts, :tick_interval_ms, :timer.minutes(2)),
+      # The bootstrap boundary: an explicit configured height/hash, else the current
+      # RPC node tip (resolved + persisted once at startup, see `ensure_bootstrap/1`).
+      bootstrap_height:
+        Keyword.get(
+          opts,
+          :bootstrap_height,
+          Application.get_env(:athanor, Athanor.Indexer, [])[:bootstrap_height]
+        ),
+      bootstrap_hash:
+        Keyword.get(
+          opts,
+          :bootstrap_hash,
+          Application.get_env(:athanor, Athanor.Indexer, [])[:bootstrap_hash]
+        )
     }
 
     schedule_tick(state.tick_interval_ms)
-    {:ok, state}
+    # Capture the bootstrap boundary before the first cycle (note-1045 B1).
+    {:ok, state, {:continue, :ensure_bootstrap}}
+  end
+
+  @impl true
+  def handle_continue(:ensure_bootstrap, state) do
+    state = ensure_bootstrap(state)
+    # Kick the first reconcile now that the index is anchored.
+    {:noreply, advance(state, :tick)}
   end
 
   @impl true
@@ -100,6 +125,8 @@ defmodule Athanor.Indexer.TipController do
 
   @impl true
   def handle_info(:tick, state) do
+    # Retry the bootstrap capture if it deferred at startup (e.g. RPC was down).
+    state = ensure_bootstrap(state)
     state = advance(state, :tick)
     schedule_tick(state.tick_interval_ms)
     {:noreply, state}
@@ -113,6 +140,43 @@ defmodule Athanor.Indexer.TipController do
   def handle_info(_msg, state), do: {:noreply, state}
 
   ## ── Private ──
+
+  # Capture the bootstrap boundary once (note-1045 B1): resolve the configured
+  # height/hash (or the current RPC node tip), persist it, and — on a fresh index —
+  # record the anchor block so the predecessor guard has its contiguous start. A
+  # no-op if already captured; defers (retried on tick) if RPC is unavailable.
+  defp ensure_bootstrap(state) do
+    case state.bootstrap_fetch.() do
+      nil ->
+        case resolve_bootstrap(state) do
+          {:ok, height, hash} ->
+            state.bootstrap_ensure.(height, hash)
+
+            if is_binary(hash) and state.local_height.() == 0,
+              do: state.anchor_fun.(state.processor, height, hash)
+
+            state
+
+          :defer ->
+            state
+        end
+
+      _existing ->
+        state
+    end
+  end
+
+  # The configured boundary wins; otherwise anchor at the current RPC node tip.
+  defp resolve_bootstrap(%{bootstrap_height: h} = state) when is_integer(h) do
+    {:ok, h, state.bootstrap_hash || state.rpc_hash_at.(h)}
+  end
+
+  defp resolve_bootstrap(state) do
+    case safe_rpc_height(state) do
+      {:ok, tip} -> {:ok, tip, state.rpc_hash_at.(tip)}
+      :error -> :defer
+    end
+  end
 
   # Step the Machine by an event and execute the actions it returns.
   defp advance(state, event) do

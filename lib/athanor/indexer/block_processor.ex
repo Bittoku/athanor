@@ -52,6 +52,24 @@ defmodule Athanor.Indexer.BlockProcessor do
     GenServer.call(server, {:apply_branch, rollback_to, connect})
   end
 
+  @doc """
+  Records the **bootstrap anchor** — the one-time, context-only `block_process_contexts`
+  row that seeds the index at its configured boundary (Phase 7 F7.2 T7.S). Unlike a
+  normal block, the anchor's pre-bootstrap transactions are *not* indexed (the thin
+  indexer starts from here), so this is a plain insert with no RPC fetch. Idempotent.
+  Keeping it in `BlockProcessor` preserves the invariant that this module is the only
+  writer of `block_process_contexts`. Returns `{:ok, height}`.
+
+  ## Parameters
+    - `height` — the bootstrap block height.
+    - `hash` — the bootstrap block's display-order hash (lowercase hex), the row id.
+  """
+  @spec record_bootstrap_anchor(GenServer.server(), non_neg_integer(), String.t()) ::
+          {:ok, non_neg_integer()}
+  def record_bootstrap_anchor(server \\ __MODULE__, height, hash) do
+    GenServer.call(server, {:record_bootstrap_anchor, height, hash})
+  end
+
   ## ── Server Callbacks ──
 
   @impl true
@@ -63,6 +81,18 @@ defmodule Athanor.Indexer.BlockProcessor do
   @impl true
   def handle_call(:last_processed_height, _from, state) do
     {:reply, state.last_height, state}
+  end
+
+  def handle_call({:record_bootstrap_anchor, height, hash}, _from, state) do
+    %BlockProcessContext{}
+    |> BlockProcessContext.changeset(%{
+      id: hash,
+      height: height,
+      processed_at: DateTime.utc_now()
+    })
+    |> Repo.insert(on_conflict: :nothing)
+
+    {:reply, {:ok, height}, %{state | last_height: max(state.last_height, height)}}
   end
 
   def handle_call({:apply_branch, rollback_to, connect_hashes}, _from, state) do
@@ -91,14 +121,12 @@ defmodule Athanor.Indexer.BlockProcessor do
     {:noreply, state}
   end
 
-  @doc """
-  Connects a contiguous canonical branch onto `state`, halting at the first failed
-  connect, and reports the result contract (see `apply_branch/2`). `opts`:
-  `:mutated?` (whether a rollback already changed the index this op — affects
-  `:partial` vs `:error`), `:process_fun` (`(hash, state -> {:ok, height} |
-  {:error, reason}`, injectable for tests; default the private block processor).
-  Returns `{result, state}`. `@doc false` — public for unit tests only.
-  """
+  # Connects a contiguous canonical branch onto `state`, halting at the first failed
+  # connect, and reports the result contract (see `apply_branch/2`). `opts`:
+  # `:mutated?` (whether a rollback already changed the index this op — affects
+  # `:partial` vs `:error`), `:process_fun` (`(hash, state -> {:ok, height} |
+  # {:error, reason}`, injectable for tests; default the private block processor).
+  # Returns `{result, state}`. Public (but `@doc false`) for unit tests only.
   @doc false
   @spec connect_branch([binary()], map(), keyword()) :: {term(), map()}
   def connect_branch(connect_hashes, state, opts \\ []) do
@@ -248,22 +276,18 @@ defmodule Athanor.Indexer.BlockProcessor do
     end)
   end
 
-  @doc """
-  Reorg detection + **no-gap bootstrap predecessor guard** (Phase 7 F7.2 T7.1) for a
-  block at `height` whose parent is `prev_hash`:
-
-    * predecessor present and matching → `:ok`;
-    * predecessor present but a different hash → roll back below it, then refuse the
-      child (`{:error, :missing_predecessor}`) — the canonical branch must be
-      reprocessed contiguously through `apply_branch/2` first;
-    * predecessor **missing** → accepted (`:ok`) **only** when this block is exactly
-      the configured **bootstrap** block (`height == bootstrap.height` and, if the
-      bootstrap is hash-pinned, `block_hash == bootstrap.hash`); otherwise refused.
-
-  `opts`: `:bootstrap` (`%{height, hash} | nil`, default the persisted boundary),
-  `:block_hash` (this block's hex id, for the hash-pin check). `@doc false` — public
-  for unit tests only.
-  """
+  # Reorg detection + no-gap bootstrap predecessor guard (Phase 7 F7.2 T7.1) for a
+  # block at `height` whose parent is `prev_hash`:
+  #   * predecessor present and matching -> :ok;
+  #   * predecessor present but a different hash -> roll back below it, then refuse
+  #     the child ({:error, :missing_predecessor}) — the canonical branch must be
+  #     reprocessed contiguously through apply_branch/2 first;
+  #   * predecessor MISSING -> accepted (:ok) ONLY when this block is exactly the
+  #     configured bootstrap block (height == bootstrap.height and, if the bootstrap
+  #     is hash-pinned, block_hash == bootstrap.hash); otherwise refused.
+  # `opts`: `:bootstrap` (%{height, hash} | nil, default the persisted boundary),
+  # `:block_hash` (this block's hex id, for the hash-pin check). Public (but
+  # `@doc false`) for unit tests only.
   @doc false
   @spec predecessor_status(binary() | nil, non_neg_integer(), keyword()) ::
           :ok | {:error, :missing_predecessor}
