@@ -33,6 +33,21 @@ defmodule Athanor.P2P.FakePeerServer do
       learned the tx **from the network** (a relay-back). The test sends the
       command *after* `broadcast_tx` has recorded the pending broadcast, so the
       relay-back is counted rather than dropped as unknown.
+
+  ## Phase 6 (T6.4) — headers over the wire
+
+  For the fork-over-sockets headers integration the server serves headers
+  on demand:
+
+    * the `{:cmd, {:headers, payload}}` message — the server sends a `headers`
+      frame carrying the given pre-serialized body, so a test can push a chain
+      extension, a higher-work fork, or a detached run over the real socket and
+      observe the `HeadersChain`'s tip events. A client `getheaders` is otherwise
+      ignored (the test drives ordering explicitly via this command).
+    * the `{:cmd, {:inv_block, hash}}` message — the server advertises a block
+      inventory, so the client's `HeadersChain` issues a `getheaders` and thereby
+      *solicits* the subsequent `headers` reply (needed to exercise the solicited
+      detached-escalation path).
   """
 
   alias Athanor.P2P.{Frame, FrameBuffer}
@@ -122,6 +137,18 @@ defmodule Athanor.P2P.FakePeerServer do
           do:
             send_frame(sock, script.network, :inv, Inv.serialize([{:tx, script.relay_back_hash}]))
 
+        drain_commands(sock, progress, script)
+
+      # Phase 6 (T6.4): advertise a block inventory so the client's HeadersChain
+      # issues a `getheaders` — i.e. it *solicits* our subsequent `headers` reply.
+      {:cmd, {:inv_block, hash}} when is_binary(hash) ->
+        send_frame(sock, script.network, :inv, Inv.serialize([{:block, hash}]))
+        drain_commands(sock, progress, script)
+
+      # Phase 6 (T6.4): push a pre-serialized `headers` body over the wire so the
+      # client's HeadersChain folds it (extend / fork / detached run).
+      {:cmd, {:headers, payload}} when is_binary(payload) ->
+        send_frame(sock, script.network, :headers, payload)
         drain_commands(sock, progress, script)
     after
       0 -> progress

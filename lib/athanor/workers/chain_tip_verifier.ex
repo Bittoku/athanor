@@ -59,13 +59,19 @@ defmodule Athanor.Workers.ChainTipVerifier do
 
         local_height < node_height ->
           # Behind — feed missing block hashes to BlockProcessor
-          Logger.info("ChainTipVerifier: #{node_height - local_height} blocks behind, catching up")
+          Logger.info(
+            "ChainTipVerifier: #{node_height - local_height} blocks behind, catching up"
+          )
+
           catch_up(local_height + 1, node_height)
           %{state | consecutive_synced: 0}
 
         local_height > node_height ->
           # Ahead of node? Possible reorg
-          Logger.warning("ChainTipVerifier: local height #{local_height} > node #{node_height}, possible reorg")
+          Logger.warning(
+            "ChainTipVerifier: local height #{local_height} > node #{node_height}, possible reorg"
+          )
+
           %{state | consecutive_synced: 0}
       end
     else

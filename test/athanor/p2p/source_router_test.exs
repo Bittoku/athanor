@@ -20,7 +20,8 @@ defmodule Athanor.P2P.SourceRouterTest do
     validation_fetch: {:rpc, []},
     block_backfill: {:rpc, [:junglebus]},
     historical_scan: {:whatsonchain, []},
-    balance_utxo_fetch: {:whatsonchain, [:bitails]}
+    balance_utxo_fetch: {:whatsonchain, [:bitails]},
+    chain_tip: {:p2p, [:rpc]}
   }
 
   test "resolve/1 returns the documented default {primary, fallbacks} for every capability" do
@@ -30,14 +31,19 @@ defmodule Athanor.P2P.SourceRouterTest do
     end
   end
 
-  test "only raw_tx_fetch, broadcast, realtime_ingest are P2P-primary (honesty guard)" do
+  test "only raw_tx_fetch, broadcast, realtime_ingest, chain_tip are P2P-primary (honesty guard)" do
     p2p_primary =
       for {cap, _} <- @defaults,
           elem(SourceRouter.resolve(cap), 0) == :p2p,
           into: MapSet.new(),
           do: cap
 
-    assert p2p_primary == MapSet.new([:raw_tx_fetch, :broadcast, :realtime_ingest])
+    assert p2p_primary ==
+             MapSet.new([:raw_tx_fetch, :broadcast, :realtime_ingest, :chain_tip])
+  end
+
+  test "chain_tip is P2P-primary with an RPC fallback (Phase 6 §C)" do
+    assert SourceRouter.resolve(:chain_tip) == {:p2p, [:rpc]}
   end
 
   test "validation/block_backfill/historical/balance stay REST/RPC (no P2P primary)" do

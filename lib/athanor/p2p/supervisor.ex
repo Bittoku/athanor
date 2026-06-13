@@ -2,21 +2,22 @@ defmodule Athanor.P2P.Supervisor do
   @moduledoc """
   Supervises the P2P peer pool (Phase 2, T2.5).
 
-  Owns five children under `:rest_for_one`:
+  Owns six children under `:rest_for_one`:
 
     1. `Athanor.P2P.PeerRegistry` (the live-peer view), then
     2. `Athanor.P2P.MempoolObserver` (Phase 3 §C — inbound mempool ingest), then
     3. `Athanor.P2P.TxRelay` (Phase 4 §A — outbound broadcast + relay-back), then
     4. `Athanor.P2P.TxFetcher` (Phase 5 §B — `getdata` pull-fetch by txid), then
-    5. `Athanor.P2P.PeerPool` (the dialer), with `frame_sink` set to the
-       **fan-out list** `[MempoolObserver, TxRelay, TxFetcher]` so each forwarded
-       frame reaches every consumer (the observer cares about `inv`/`tx`/
+    5. `Athanor.P2P.HeadersChain` (Phase 6 §B — headers chain + reorg detection), then
+    6. `Athanor.P2P.PeerPool` (the dialer), with `frame_sink` set to the
+       **fan-out list** `[MempoolObserver, TxRelay, TxFetcher, HeadersChain]` so each
+       forwarded frame reaches every consumer (the observer cares about `inv`/`tx`/
        `notfound`; the relay about `getdata`/`inv`/`reject`; the fetcher about
-       `tx`/`notfound` for txids it is actively pulling).
+       `tx`/`notfound`; the headers chain about `inv(MSG_BLOCK)`/`headers`).
 
   `:rest_for_one` is deliberate and ordered: every sink name must be registered
   before the pool forwards frames to them; a registry restart cascades to all;
-  a pool crash leaves the registry, observer, relay, and fetcher intact.
+  a pool crash leaves the registry, observer, relay, fetcher, and headers chain intact.
 
   This supervisor is **config-gated and off by default** (per the plan, P2P is
   disabled until soak-tested). It runs as a *sibling* of the existing runtime
@@ -30,6 +31,7 @@ defmodule Athanor.P2P.Supervisor do
   require Logger
 
   alias Athanor.P2P.{
+    HeadersChain,
     MempoolObserver,
     Network,
     PeerPool,
@@ -43,8 +45,9 @@ defmodule Athanor.P2P.Supervisor do
   alias Athanor.Services.Broadcast
 
   # The pool's frame_sink fan-out (§A): every post-handshake frame reaches the
-  # inbound observer, the outbound relay, and the pull-fetcher (Phase 5).
-  @frame_sinks [MempoolObserver, TxRelay, TxFetcher]
+  # inbound observer, the outbound relay, the pull-fetcher (Phase 5), and the
+  # headers chain (Phase 6).
+  @frame_sinks [MempoolObserver, TxRelay, TxFetcher, HeadersChain]
 
   # Application-env key for the P2P stack: `config :athanor, Athanor.P2P, ...`.
   @config_key Athanor.P2P
@@ -82,14 +85,20 @@ defmodule Athanor.P2P.Supervisor do
       |> Keyword.get(:fetcher_opts, [])
       |> Keyword.put_new(:name, TxFetcher)
 
-    # `:rest_for_one`, ordered Registry → Observer → TxRelay → TxFetcher → Pool:
-    # every sink name must be registered before the pool starts forwarding frames
-    # to them, and a registry restart cascades to all.
+    headers_opts =
+      opts
+      |> Keyword.get(:headers_opts, default_headers_opts(pool_config.network))
+      |> Keyword.put_new(:name, HeadersChain)
+
+    # `:rest_for_one`, ordered Registry → Observer → TxRelay → TxFetcher →
+    # HeadersChain → Pool: every sink name must be registered before the pool
+    # starts forwarding frames to them, and a registry restart cascades to all.
     children = [
       {PeerRegistry, [name: PeerRegistry]},
       {MempoolObserver, observer_opts},
       {TxRelay, relay_opts},
       {TxFetcher, fetcher_opts},
+      {HeadersChain, headers_opts},
       {PeerPool, pool_config}
     ]
 
@@ -127,6 +136,50 @@ defmodule Athanor.P2P.Supervisor do
   # lifecycle events back to the `broadcasts` audit rows (§C); target selection
   # and TTL/cap use their production defaults.
   defp default_relay_opts, do: [audit: &Broadcast.apply_relay_event/1]
+
+  # HeadersChain options for the supervised child (Phase 6 §C). The synthetic root
+  # is seeded from the node's current best block over RPC, and the header PoW gate
+  # is bound to the active network's consensus pow-limit. Window/tick use their
+  # defaults.
+  #
+  # Phase 6 ships the headers chain as **reorg detection only**: tip events are
+  # logged (operator visibility), not yet bridged onto the index. Driving the index
+  # from these events — the RPC↔P2P tip-authority handoff, no-gap recovery, and the
+  # bootstrap boundary — is the Phase 7 follow-up (docs/thin-node-p2p-phase7-followups.md
+  # F7.2); until then the existing RPC `ChainTipVerifier` poll remains the sole tip
+  # authority for the index.
+  defp default_headers_opts(network) do
+    [
+      seed: &rpc_seed/0,
+      on_tip: &log_tip_event/1,
+      pow_limit: network.pow_limit
+    ]
+  end
+
+  # Detection-only tip sink (Phase 6): surface the chain's tip decisions to the log
+  # without mutating the index. Phase 7 (F7.2) replaces this with the index bridge.
+  defp log_tip_event(event) do
+    Logger.info(
+      "HeadersChain tip event (detection-only; index integration is Phase 7): #{inspect(event)}"
+    )
+
+    :ok
+  end
+
+  # Seed the header tree from the node's current best block via RPC. Returns
+  # `{:ok, height, wire_hash}` — the hash is converted display→wire order to match
+  # how header `prev_block`/`hash` bytes arrive on the P2P wire. Any RPC/decoding
+  # failure returns `{:error, _}`; the chain then starts inert and retries on tick
+  # (a failed seed never crashes the supervisor).
+  defp rpc_seed do
+    with {:ok, height} <- Athanor.Blockchain.RpcClient.get_block_count(),
+         {:ok, hash_hex} <- Athanor.Blockchain.RpcClient.get_block_hash(height),
+         {:ok, display} <- Base.decode16(hash_hex, case: :mixed) do
+      {:ok, height, Athanor.P2P.Codec.Hash.display_to_wire(display)}
+    else
+      other -> {:error, other}
+    end
+  end
 
   # Seed a `Watchlist` from the watched-address table. Wrapped defensively: a
   # transient DB unavailability at P2P start (P2P is enabled post-boot) must not
