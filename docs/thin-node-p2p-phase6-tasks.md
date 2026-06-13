@@ -52,9 +52,11 @@ A pure reducer over a bounded set of headers — no process, no IO, no DB. It is
 is the best tip and did a reorg happen".
 
 **State (`%Tree{}`):**
-- `nodes` — `%{wire_hash => %{header: %BlockHeader{}, height: non_neg_integer, work: pos_integer, cum_work:
-  pos_integer, prev: wire_hash}}`. Hashes are **wire/internal order** (`BlockHeader.hash/1`), as everywhere in
-  the P2P layer; conversion to display order happens only at the store boundary.
+- `nodes` — `%{wire_hash => %{header: %BlockHeader{} | nil, height: non_neg_integer, work: non_neg_integer,
+  cum_work: non_neg_integer, prev: wire_hash | nil}}`. Hashes are **wire/internal order** (`BlockHeader.hash/1`),
+  as everywhere in the P2P layer; conversion to display order happens only at the store boundary. The single
+  **synthetic seed root** (§B) is the only node with `header: nil`, `prev: nil`, `work: 0`, `cum_work: 0` — it
+  exists so real headers have a parent to attach to; it is never emitted in an orphan/connect set.
 - `tip` — the `wire_hash` of the node with the greatest `cum_work` (ties broken by **first-seen**, never by
   height — the plan's explicit rule).
 - `root` — the oldest retained header (the window's low edge); `window` (default **144**, ~1 day of blocks) is
@@ -82,7 +84,7 @@ the trust floor that makes cumulative-work comparison safe against cheap forgery
 |---|---|---|
 | `{:connect, headers}` (an ordered list from `headers` msg) | For each header in order: let `parent = BlockHeader.prev_hash_wire(header)` (the raw wire-order `prev_block`). If `parent ∈ nodes` **and** PoW valid → add node keyed by `BlockHeader.hash/1` with `prev = parent`, `height = nodes[parent].height+1`, `cum_work` computed; if `parent ∉ nodes` → **detached**, drop it and emit `{:detached, count}` (see below); a header already present is ignored (idempotent); a PoW-invalid header is rejected. After connecting, recompute `tip = argmax cum_work`. If `tip` changed and the new tip is **not** a descendant of the old tip → a **reorg**: walk both tips back (via each node's wire-order `prev`) to the common ancestor; emit `{:reorg, %{orphan: [old-branch hashes tip→fork, exclusive of fork], connect: [new-branch hashes fork→new-tip]}}`. If the new tip simply extends the old tip → emit `{:extend, [new hashes]}`. | `{:extend, hashes}` \| `{:reorg, %{orphan, connect}}` \| `{:detached, count}` \| none |
 | `{:locator, n}` | Produce a block **locator** (the getheaders request input): `n` (default ≤ 32) hashes from `tip` backwards with exponential step-back (1,1,2,4,8,…) plus `root`, wire order, for `Messages.Headers.serialize_get_headers/3`. | `{:locator, [wire_hash]}` |
-| `:prune` | Drop **every** node — active-path or fork — whose `height < tip.height − window`, and set `root` to the active-path node at `height = tip.height − window` (or the lowest retained active node if shallower). This bounds the tree to ~`window` active-path nodes plus the bounded set of in-window fork nodes; the active spine is **not** retained forever. | none |
+| `:prune` | Advance `root` to the active-path node at `height = tip.height − window` (or the lowest retained active node if shallower), then **retain only `root` and its descendants** — drop every node whose wire-order `prev` chain no longer reaches `root`. This drops both nodes below the height cutoff **and** any fork subtree whose fork point fell below the new `root` (so no "retained but unrootable" branch survives). Bounds the tree to ~`window` nodes **and** preserves the invariant that every retained node connects to `root`. | none |
 
 - **Detached headers** (parent not in the window) — **single policy: drop-and-re-request.** A header whose
   raw `prev_block` is not a known node is **dropped** by the reducer (it emits `{:detached, count}` for
@@ -94,9 +96,12 @@ the trust floor that makes cumulative-work comparison safe against cheap forgery
   detached header leaves the tree unchanged (no node added) and yields `{:detached, _}`; T6.2 asserts the
   shell re-issues `getheaders` on it.
 - **Deep-reorg guard (blocker — bounded window honesty).** Any reorg the **reducer** detects is necessarily
-  *within* the window: both tips connect to in-window nodes, so their common ancestor is ≥ `root`, and the
-  reducer therefore always emits a well-formed `{:reorg, …}` — it **never** fabricates a partial set and
-  **never** itself emits `{:reorg_too_deep}`. A reorg whose fork point is **below** the retained window does
+  *within* the window: both tips connect to retained nodes, and because `:prune` keeps **only `root` and its
+  descendants**, every retained node's `prev` chain reaches `root` — so any two retained tips share an in-window
+  common ancestor (≥ `root`). A fork whose fork point was pruned is itself dropped (never "retained but
+  unrootable"), so it cannot resurface as a connected branch with no reachable ancestor. The reducer therefore
+  always emits a well-formed `{:reorg, …}` — it **never** fabricates a partial set and **never** itself emits
+  `{:reorg_too_deep}`. A reorg whose fork point is **below** the retained window does
   not reach the reducer as a reorg at all: the new branch's first header has a parent below `root`, so it
   arrives as a **detached** header. Escalating that condition is the **GenServer's** job (§B): when successive
   `getheaders`/`headers` rounds keep returning *only* detached headers (our best locator cannot bridge the gap)
@@ -120,7 +125,10 @@ rejected (not added, no work credited); a **detached** header (unknown raw paren
 (no node added) and yields `{:detached, _}` (the reducer never emits `{:reorg_too_deep}` — that escalation is
 the GenServer's, T6.2); `:prune` on a chain longer than `window` drops **every** node below `tip.height −
 window` (active-path included), bounding the node count and advancing `root` to the window's low edge;
-`:locator` yields a correct exponential-step-back locator.
+**retained-fork safety** — a fork node learned *before* a prune whose fork point is *then* pruned below `root`
+is itself dropped by `:prune` (retain-only-`root`-and-descendants), so a later extension of that fork arrives
+as **detached** (→ bounded GenServer escalation), never a connected branch that yields a partial/un-walkable
+`{:reorg}`; `:locator` yields a correct exponential-step-back locator.
 
 ---
 
@@ -129,9 +137,13 @@ window` (active-path included), bounding the node count and advancing `root` to 
 The thin shell: a `frame_sink` member that drives the pure `Tree` and performs the wire exchange.
 
 - **Seed once from REST.** On start (when P2P is enabled), seed the tip from the existing
-  `ChainTipVerifier`/RPC source: fetch the current tip height+hash via the injected `:seed` seam (default
-  `RpcClient.get_block_count/0` + `get_block_hash/1`) and plant it as the `Tree` `root`/`tip` so the locator
-  has a starting point. This is the headers-plane analogue of the DXS "seed from REST once" rule.
+  `ChainTipVerifier`/RPC source: fetch the current tip **height + hash** via the injected `:seed` seam (default
+  `RpcClient.get_block_count/0` + `get_block_hash/1`). Plant it as a **synthetic root node** — `height =
+  seed_height`, the wire-order hash as the key, `header: nil`, `work: 0`, `cum_work: 0`, `prev: nil` — which is
+  both `root` and the initial `tip`. We hold only the hash (not the full header) because only **relative** work
+  **above** the seed is ever compared: every candidate chain branches at or above the seed, so a zero baseline
+  is correct and no seed header is needed. Real headers attach above it when their `prev_hash_wire` equals the
+  seed hash. This is the headers-plane analogue of the DXS "seed from REST once" rule.
 - **`inv(MSG_BLOCK)` → `getheaders`.** On `{:peer, pid, :frame, %Frame{command: "inv"}}` carrying a
   `MSG_BLOCK` (type 2) vector, ask the `Tree` for a `{:locator, n}` and send
   `Messages.Headers.serialize_get_headers(version, locator, <<0::256>>)` via `Peer.send_frame(pid,
