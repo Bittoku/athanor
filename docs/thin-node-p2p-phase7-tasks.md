@@ -131,9 +131,10 @@ Handler (in the `BlockProcessor` process, ordered):
 1. If `rollback_to` is an integer: `rollback_to/1`, then set `last_height = rollback_to`
    **before** connecting (I3 — note 941 B3).
 2. Reduce `connect` with `Enum.reduce_while/3`, **halting at the first failure** (I1/I2),
-   each block through `do_process_block/1` (predecessor guard, §5). Return `{:ok, …}` if
-   all connected, `{:partial, last_success_height, reason}` if it halted after ≥1
-   rollback/connect, `{:error, reason}` if nothing changed.
+   each block through the **private** `do_process_block/1` (predecessor guard, §5) — *not*
+   via any public cast (§4). Return `{:ok, …}` if all connected,
+   `{:partial, last_success_height, reason}` if it halted after ≥1 rollback/connect,
+   `{:error, reason}` if nothing changed.
 
 The controller uses the result: `:ok` at node tip → `:synced`; `:ok`/`:partial` below
 node tip → stay `:syncing` and schedule a follow-up cycle (deterministic replay of the
@@ -174,10 +175,16 @@ ZMQ/JungleBus/P2P hint — or the RPC poll — during an in-flight handoff/recov
 write `block_process_contexts` except through `apply_branch/2`. (Resolves note-1018 B2 +
 note-1027 B1.)
 
-> The existing `BlockProcessor.handle_cast({:process_block_hash, …})` is retained only as
-> the controller's internal connect primitive (called from `apply_branch`’s reduce); the
-> public out-of-band cast entry points (ZMQ, JungleBus, and the legacy `ChainTipVerifier`
-> poll) are removed in T7.S.
+> **The public `BlockProcessor.handle_cast({:process_block_hash, …})` mutation cast is
+> removed entirely** (note-1027 B1 follow-up, note-1035 B1). Removing its callers is not
+> enough — a named-GenServer cast stays externally reachable and would bypass the
+> predecessor guard + result contract. Instead, `apply_branch/2`'s synchronous handler
+> connects each block by calling a **private** helper (`do_process_block/1`) directly in
+> the `BlockProcessor` process; there is no remaining public block-mutation message. Any
+> residual `{:process_block_hash, _}` cast (e.g. an out-of-tree caller) falls through to
+> the catch-all `handle_cast` and is a **no-op** (it cannot write `block_process_contexts`).
+> So the only way to mutate the index is `apply_branch/2`, which returns its result
+> contract.
 
 ---
 
@@ -218,6 +225,7 @@ no-gap invariant (I1) is total.
 | note-1018 B2 (ZMQ/JBus) | §4 producers become hints; out-of-band casts removed |
 | note-1018 B3 (async apply) | §3b synchronous result contract |
 | note-1027 B1 (legacy RPC poller) | §2 + §4 — `ChainTipVerifier` retired/subsumed by `TipController`; single mutation owner (T7.S) |
+| note-1035 B1 (public mutation cast) | §4 + §3b — public `{:process_block_hash, …}` cast removed; `apply_branch/2` connects via the private `do_process_block/1` (T7.1) |
 
 ---
 
@@ -233,11 +241,14 @@ no-gap invariant (I1) is total.
   Tests: every §2 transition incl. hint coalescing and the `{:partial}`/`:defer`/`:error`
   result foldings.
 - **T7.1 — `BlockProcessor.apply_branch/2`** (synchronous, ordered, result contract) +
-  the bootstrap predecessor guard (§5, `predecessor_status/2`). Tests: rollback+connect
-  atomic; halt on first failure → `{:partial, last_height, _}`; `last_height` integrity
-  for `[]`/`[failing]`/`[ok, failing, …]`; bootstrap block accepted, any other
-  missing-predecessor (incl. a high block on an empty index) refused; mismatch rolls
-  back + refuses.
+  the bootstrap predecessor guard (§5, `predecessor_status/2`) + **removal of the public
+  `{:process_block_hash, …}` mutation cast** (apply_branch connects via the private
+  `do_process_block/1`; §4). Tests: rollback+connect atomic; halt on first failure →
+  `{:partial, last_height, _}`; `last_height` integrity for `[]`/`[failing]`/`[ok, failing, …]`;
+  bootstrap block accepted, any other missing-predecessor (incl. a high block on an empty
+  index) refused; mismatch rolls back + refuses; **a direct
+  `GenServer.cast(BlockProcessor, {:process_block_hash, hash})` does not create or update
+  `block_process_contexts`** (the only mutation path is `apply_branch/2`).
 - **T7.2 — reconcile-by-hash** (`reconcile_plan/4` + the contiguous-prefix builder),
   ported from `5472b2b`. Tests: the full matrix (synced / behind / same-height divergence
   / orphan-ahead / unknown-hash defer / contiguous-prefix / reorg-prefix).
@@ -279,6 +290,10 @@ no-gap invariant (I1) is total.
 - note-1027 (B1): the application supervision tree has exactly **one** index-tip mutation
   owner — `TipController`, with `ChainTipVerifier` removed — and neither the RPC poll nor
   any producer can write `block_process_contexts` except through `apply_branch/2` (T7.S/T7.4).
+- note-1035 (B1): the public `{:process_block_hash, …}` mutation cast is removed; a direct
+  `GenServer.cast(BlockProcessor, {:process_block_hash, hash})` cannot create/update
+  `block_process_contexts` — every block write goes through `apply_branch/2` and returns
+  its result contract (T7.1).
 - The reused MR !18 matrix (reconcile, serialized apply, no-gap, last_height) green.
 - Full `mix test` clean; warnings-clean (bsv_sdk dep excepted); format fixpoint under the
   1.15.7 import_deps toolchain **and** `mix format --check-formatted`; no
