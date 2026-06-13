@@ -13,9 +13,18 @@ state), then the bottom-up TDD tasks. Same shape as Phases 1–5: pure reducers 
 IO; inject time/timers/transport/seams; no `Process.sleep`/`Process.alive?`; commit `feat(p2p): <task>` (no AI
 attribution); format under the project's Elixir **1.15** toolchain (import_deps-aware).
 
-The Phase-0 codecs already exist and are reused unchanged: `Messages.Headers` (`getheaders`/`headers`),
-`Messages.BlockHeader` (`hash/1` wire-order id, `prev_hash/1` display-order parent, `raw` 80 bytes), and
-`Codec.Hash.double_sha256/1`.
+The Phase-0 codecs already exist and are reused: `Messages.Headers` (`getheaders`/`headers`),
+`Messages.BlockHeader` (`hash/1` wire-order id, `raw` 80 bytes), and `Codec.Hash.double_sha256/1`.
+
+**Byte order — one contract (blocker, settle first).** The tree is **entirely wire/internal order**: node
+keys, the `tip`/`root`, and each node's `prev` are all wire-order hashes (`BlockHeader.hash/1` order). The
+parent link is therefore the header's **raw** previous-block field (bytes 4..35 of `raw`, *not* reversed) —
+**not** `BlockHeader.prev_hash/1`, which returns **display** order for the store layer. To make this
+unambiguous in code, T6.0/T6.S add a wire-order accessor `BlockHeader.prev_hash_wire/1` (the raw 32-byte
+`prev_block` slice) and the tree uses **only** that for parent lookup; `prev_hash/1` (display) is reserved
+**strictly** for the `ChainTipVerifier`/store boundary (§C). So a header whose raw `prev_block` equals a
+stored node's `hash/1` connects — it is never mis-classified as detached because of an order mismatch (T6.0
+asserts exactly this).
 
 ---
 
@@ -71,30 +80,37 @@ the trust floor that makes cumulative-work comparison safe against cheap forgery
 
 | Event | Decision | Emitted |
 |---|---|---|
-| `{:connect, headers}` (an ordered list from `headers` msg) | For each header in order: if `prev` ∈ `nodes` and PoW valid → add node with `height = prev.height+1`, `cum_work` computed; else if `prev` ∉ `nodes` → **detached** (buffer or drop — see below); a header already present is ignored (idempotent). After connecting, recompute `tip = argmax cum_work`. If `tip` changed and the new tip is **not** a descendant of the old tip → a **reorg**: walk both tips back to the common ancestor; emit `{:reorg, %{orphan: [old-branch hashes tip→fork, exclusive of fork], connect: [new-branch hashes fork→new-tip]}}`. If the new tip simply extends the old tip → emit `{:extend, [new hashes]}`. | `{:extend, hashes}` \| `{:reorg, %{orphan, connect}}` \| none |
+| `{:connect, headers}` (an ordered list from `headers` msg) | For each header in order: let `parent = BlockHeader.prev_hash_wire(header)` (the raw wire-order `prev_block`). If `parent ∈ nodes` **and** PoW valid → add node keyed by `BlockHeader.hash/1` with `prev = parent`, `height = nodes[parent].height+1`, `cum_work` computed; if `parent ∉ nodes` → **detached**, drop it and emit `{:detached, count}` (see below); a header already present is ignored (idempotent); a PoW-invalid header is rejected. After connecting, recompute `tip = argmax cum_work`. If `tip` changed and the new tip is **not** a descendant of the old tip → a **reorg**: walk both tips back (via each node's wire-order `prev`) to the common ancestor; emit `{:reorg, %{orphan: [old-branch hashes tip→fork, exclusive of fork], connect: [new-branch hashes fork→new-tip]}}`. If the new tip simply extends the old tip → emit `{:extend, [new hashes]}`. | `{:extend, hashes}` \| `{:reorg, %{orphan, connect}}` \| `{:detached, count}` \| none |
 | `{:locator, n}` | Produce a block **locator** (the getheaders request input): `n` (default ≤ 32) hashes from `tip` backwards with exponential step-back (1,1,2,4,8,…) plus `root`, wire order, for `Messages.Headers.serialize_get_headers/3`. | `{:locator, [wire_hash]}` |
 | `:prune` | Drop nodes whose `height < tip.height − window` **and** that are not on the active tip's path, advancing `root`. | none |
 
-- **Detached headers** (parent not in the window): a small bounded buffer (`max_detached`, default 256) holds
-  them; when a connecting header supplies the missing parent they are re-tried, else they age out. This avoids
-  unbounded growth from a peer streaming junk. (A simpler v1 may **drop** detached headers and rely on a fresh
-  `getheaders` with a better locator — the doc picks **drop-and-re-request** as the default to keep the
-  reducer small; buffering is a noted option.)
+- **Detached headers** (parent not in the window) — **single policy: drop-and-re-request.** A header whose
+  raw `prev_block` is not a known node is **dropped** by the reducer (it emits `{:detached, count}` for
+  observability and stores nothing), and the GenServer responds by issuing a fresh `getheaders` with an
+  up-to-date locator so the peer re-sends the missing run **in order** from a point we have. There is **no**
+  detached buffer and **no** `max_detached` state — dropping keeps the reducer small and bounds memory to the
+  window alone, and `headers` messages already arrive in ancestor→descendant order from a locator so a detached
+  header is the signal "my locator was stale", handled by re-requesting, not by buffering. T6.0 asserts a
+  detached header leaves the tree unchanged (no node added) and yields `{:detached, _}`; T6.2 asserts the
+  shell re-issues `getheaders` on it.
 - **Deep-reorg guard (blocker — bounded window honesty).** If the common ancestor of a reorg would be **below
   `root`** (the reorg is deeper than the retained window), the tree **cannot** compute correct orphan/connect
   sets. It emits `{:reorg_too_deep, %{depth_exceeded: true}}` and does **not** fabricate a partial set — the
   GenServer surfaces this as an operator **alert** and falls back to the RPC `ChainTipVerifier` (§C), matching
   the plan's §7 "deep reorg > window → degraded state requiring operator action" rule.
 - **Idempotent / order-independent:** connecting the same header twice, or headers slightly out of order
-  within a batch, converges to the same tree (re-tried via the detached buffer / re-request).
+  within a batch, converges to the same tree (a momentarily-detached header is dropped and re-requested).
 
-**Tests (T6.0).** PoW-valid linear extend → `{:extend, …}`, tip advances, `cum_work` increases; a
+**Tests (T6.0).** **Byte order:** a header whose raw `prev_block` equals a stored node's `BlockHeader.hash/1`
+**connects** (parent found, node added) and is **not** classified as detached — the explicit guard against the
+wire/display mismatch. Then: PoW-valid linear extend → `{:extend, …}`, tip advances, `cum_work` increases; a
 higher-`work` **shorter** branch overtakes a longer lower-work branch → tip switches by **work not height**;
 a fork that switches tip → `{:reorg, %{orphan, connect}}` with the exact common-ancestor split (orphan =
 old-branch hashes above the fork, connect = new-branch hashes above the fork); a header failing PoW is
-rejected (not added, no work credited); a detached header (unknown parent) does not corrupt the tree; a reorg
-whose ancestor is below `root` → `{:reorg_too_deep, …}` (no fabricated set); `:prune` drops off-tip nodes
-below the window and advances `root`; `:locator` yields a correct exponential-step-back locator.
+rejected (not added, no work credited); a **detached** header (unknown raw parent) leaves the tree unchanged
+(no node added) and yields `{:detached, _}`; a reorg whose ancestor is below `root` → `{:reorg_too_deep, …}`
+(no fabricated set); `:prune` drops off-tip nodes below the window and advances `root`; `:locator` yields a
+correct exponential-step-back locator.
 
 ---
 
@@ -123,7 +139,7 @@ The thin shell: a `frame_sink` member that drives the pure `Tree` and performs t
   RPC) rather than crashing the headers chain — `safe_*` helpers mirroring `TxRelay`/`TxFetcher`.
 
 Injected collaborators: `:seed` (REST tip), `:on_tip` (`(tip_event -> any)`), `:registry`, `:now_fun`,
-`:tick_interval_ms`, `:window`/`:max_detached`, `:selector` for which peer(s) to `getheaders` from.
+`:tick_interval_ms`, `:window`, `:selector` for which peer(s) to `getheaders` from.
 
 **Wiring.** `HeadersChain` joins the pool fan-out as a `frame_sink` member alongside the observer, relay, and
 fetcher: `frame_sink: [MempoolObserver, TxRelay, TxFetcher, HeadersChain]`, supervised under the existing
@@ -167,10 +183,12 @@ defaults to `{:p2p, [:rpc]}`.
 
 ## Tasks (bottom-up, each independently verifiable)
 
-### T6.S — `HeadersChain` frame_sink + supervisor wiring — do FIRST
-**RED:** pool with `frame_sink: [MempoolObserver, TxRelay, TxFetcher, HeadersChain]` forwards a frame to all
-four; supervisor starts `HeadersChain` (Registry → Observer → TxRelay → TxFetcher → **HeadersChain** → Pool).
-**GREEN:** add the child + extend the fan-out list. **REFACTOR:** keep single-sink/`nil` fast paths.
+### T6.S — `HeadersChain` frame_sink + supervisor wiring + wire-order prev helper — do FIRST
+**RED:** `BlockHeader.prev_hash_wire/1` returns the raw 32-byte `prev_block` (wire order, no reversal),
+distinct from the existing display-order `prev_hash/1`; the pool with `frame_sink: [MempoolObserver, TxRelay,
+TxFetcher, HeadersChain]` forwards a frame to all four; the supervisor starts `HeadersChain` (Registry →
+Observer → TxRelay → TxFetcher → **HeadersChain** → Pool). **GREEN:** add `prev_hash_wire/1`; add the child +
+extend the fan-out list. **REFACTOR:** keep single-sink/`nil` fast paths.
 
 ### T6.0 — Pure headers tree — `Athanor.P2P.HeadersChain.Tree` (§A)
 **RED:** `tree_test.exs` — every §A row (PoW validation, cumulative-work tip selection by work-not-height,
@@ -220,8 +238,8 @@ chain advances its tip to (near) the node's tip within a bounded window; `P2P_SM
 - **Reorg detection emits correct orphan/connect sets** via the common-ancestor walk; a reorg **deeper than the
   retained window** yields `{:reorg_too_deep}` (no fabricated set) → operator alert + RPC fallback (the plan's
   §7 degraded-state rule).
-- **Bounded window:** `:prune` keeps the tree to `window` depth off the tip + a bounded detached buffer; no
-  unbounded growth from a junk-streaming peer.
+- **Bounded window:** `:prune` keeps the tree to `window` depth off the tip; detached headers are dropped (no
+  buffer), so there is no unbounded growth from a junk-streaming peer.
 - **`ChainTipVerifier` fed from P2P, RPC-fallback intact:** `{:extend}`/`{:reorg}` drive the **existing**
   catch-up/rollback machinery (Phase 6 detects, does not duplicate DB work); P2P-disabled / zero-peers /
   too-deep all collapse to **exactly today's** RPC poll — cold-start safety, routed via `SourceRouter`
