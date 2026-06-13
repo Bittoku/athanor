@@ -13,6 +13,7 @@ defmodule Athanor.P2P.SupervisorTest do
 
   alias Athanor.P2P.{
     Frame,
+    HeadersChain,
     MempoolObserver,
     Network,
     PeerPool,
@@ -149,7 +150,7 @@ defmodule Athanor.P2P.SupervisorTest do
 
   test "runtime_pool_config wires the frame_sink as the [observer, relay, fetcher] fan-out (Phase 5 §A)" do
     assert Athanor.P2P.Supervisor.runtime_pool_config().frame_sink ==
-             [MempoolObserver, TxRelay, TxFetcher]
+             [MempoolObserver, TxRelay, TxFetcher, HeadersChain]
   end
 
   ## ── Phase 4: TxRelay wiring (§A fan-out) ──
@@ -171,14 +172,33 @@ defmodule Athanor.P2P.SupervisorTest do
     assert Enum.find_index(order, &(&1 == TxRelay)) < Enum.find_index(order, &(&1 == PeerPool))
   end
 
-  test "the default frame_sink fans out to the observer, relay, and fetcher" do
+  test "the default frame_sink fans out to the observer, relay, fetcher, and headers chain" do
     sup = start_supervised!({Athanor.P2P.Supervisor, [pool_config: fake_config()]})
 
     assert :sys.get_state(child_pid(sup, PeerPool)).config.frame_sink == [
              MempoolObserver,
              TxRelay,
-             TxFetcher
+             TxFetcher,
+             HeadersChain
            ]
+  end
+
+  ## ── Phase 6: HeadersChain wiring (§B fan-out) ──
+
+  test "starts the HeadersChain under the tree, registered, after the fetcher and before the pool" do
+    sup = start_supervised!({Athanor.P2P.Supervisor, [pool_config: fake_config()]})
+
+    ids = Supervisor.which_children(sup) |> Enum.map(&elem(&1, 0))
+    assert HeadersChain in ids
+    assert is_pid(Process.whereis(HeadersChain))
+
+    order = Supervisor.which_children(sup) |> Enum.map(&elem(&1, 0)) |> Enum.reverse()
+
+    assert Enum.find_index(order, &(&1 == TxFetcher)) <
+             Enum.find_index(order, &(&1 == HeadersChain))
+
+    assert Enum.find_index(order, &(&1 == HeadersChain)) <
+             Enum.find_index(order, &(&1 == PeerPool))
   end
 
   ## ── Phase 5: TxFetcher wiring (§A fan-out) ──
