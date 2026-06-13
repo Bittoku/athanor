@@ -109,8 +109,13 @@ defmodule Athanor.Indexer.TransactionProcessor do
     # their source. No schema migration.
     case Repo.get_by(MetaTransaction, txid: txid_binary) do
       %MetaTransaction{} = existing ->
-        union_source_only(existing, source)
-        {:ok, txid_hex}
+        # Check + propagate the source-union update (note-1069 B1): a failed write must
+        # surface so a block-recording caller fails closed rather than committing a
+        # context over a re-observation that did not persist.
+        case union_source_only(existing, source) do
+          {:ok, _} -> {:ok, txid_hex}
+          {:error, reason} -> {:error, {:source_union_failed, reason}}
+        end
 
       nil ->
         index_new_tx(
@@ -213,98 +218,131 @@ defmodule Athanor.Indexer.TransactionProcessor do
          txid_binary,
          txid_hex
        ) do
-    # 2. Process inputs — mark UTXOs as spent. STAS 3.0 spec v0.1 §8.2 / §9.6:
-    # the unlocking script encodes a `spendType` byte that classifies the
-    # operation (transfer / freeze_unfreeze / confiscation / swap_cancel).
-    # Record this on the spent UTXO so downstream queries can recover the
-    # operation class. Non-STAS-3.0 inputs are skipped — the parser only
-    # runs against confirmed STAS 3.0 unlocks.
+    # Each required DB write is checked + propagated (note-1069 B1): the first real
+    # failure stops the pipeline and returns `{:error, reason}`, so a block-recording
+    # caller rolls the whole per-block mutation back instead of committing a context
+    # over partially-indexed state. PubSub + waiter reprocessing run only on full
+    # success.
     spend_op = stas3_spend_op(tx)
 
-    Enum.each(tx.inputs, fn input ->
-      unless Transaction.is_coinbase?(tx) do
-        source_txid = input.source_txid
-        UtxoManager.spend_utxo(source_txid, input.source_tx_out_index, txid_binary)
+    with :ok <- spend_inputs(tx, spend_op, txid_binary),
+         :ok <- create_outputs(classified, tx, stas_attrs, block_height, txid_binary, txid_hex),
+         :ok <- record_history(tx, matched_addresses, stas_attrs, block_height, txid_hex) do
+      publish_events(matched_addresses, txid_hex)
 
-        if spend_op do
-          UtxoManager.set_stas3_op(source_txid, input.source_tx_out_index, spend_op)
-        end
+      Logger.info(
+        "Indexed tx #{txid_hex} (#{length(matched_addresses)} addrs, #{length(matched_tokens)} tokens)"
+      )
+
+      # If any prior tx was deferred waiting on this txid as a parent, re-run their
+      # lineage now. Cascades transitively for chains.
+      reprocess_waiters(txid_hex)
+
+      {:ok, txid_hex}
+    end
+  end
+
+  # Classify a required write's result. A successful write is `:ok`. `{:error, :not_found}`
+  # from a UTXO update is **benign** — the parent UTXO simply isn't in our watched set
+  # (normal for block txs touching unwatched coins) — so it does NOT fail the block. Any
+  # other error (changeset / DB) is a real failure that must roll the block back.
+  @doc false
+  @spec required_write(term()) :: :ok | {:error, term()}
+  def required_write({:ok, _}), do: :ok
+  def required_write({:error, :not_found}), do: :ok
+  def required_write({:error, reason}), do: {:error, reason}
+
+  # Run `fun` over each item, halting (and returning `{:error, reason}`) at the first
+  # write that fails closed; `:ok` if all succeed.
+  defp reduce_writes(items, fun) do
+    Enum.reduce_while(items, :ok, fn item, :ok ->
+      case fun.(item) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
+  end
 
-    # 3. Process outputs — create new UTXOs. For STAS 3.0 outputs whose
-    # protoID matches a watched issuance, validate the post-OP_RETURN
-    # payload (spec §4) byte-identity invariant and seed the canonical
-    # bytes / service-field authorities (spec §5.2.3) on first sight.
-    Enum.each(classified, fn {vout, script_type, token_id} ->
+  # 2. Process inputs — mark spent UTXOs (and their STAS 3.0 op class, spec v0.1 §8.2 /
+  # §9.6). A parent UTXO we don't track is benign; a real update error fails closed.
+  defp spend_inputs(tx, spend_op, txid_binary) do
+    if Transaction.is_coinbase?(tx) do
+      :ok
+    else
+      reduce_writes(tx.inputs, fn input ->
+        with :ok <-
+               required_write(
+                 UtxoManager.spend_utxo(input.source_txid, input.source_tx_out_index, txid_binary)
+               ) do
+          if spend_op do
+            required_write(
+              UtxoManager.set_stas3_op(input.source_txid, input.source_tx_out_index, spend_op)
+            )
+          else
+            :ok
+          end
+        end
+      end)
+    end
+  end
+
+  # 3. Process outputs — create new UTXOs. For STAS 3.0 outputs whose protoID matches a
+  # watched issuance, validate the post-OP_RETURN payload (spec §4) byte-identity
+  # invariant and seed the canonical bytes / service-field authorities (spec §5.2.3) on
+  # first sight. A failed UTXO insert fails the block closed.
+  defp create_outputs(classified, tx, stas_attrs, block_height, txid_binary, txid_hex) do
+    reduce_writes(classified, fn {vout, script_type, token_id} ->
       output = Enum.at(tx.outputs, vout)
       script_binary = BSV.Script.to_binary(output.locking_script)
 
-      address = script_address(output.locking_script)
-
-      token_type =
-        case script_type do
-          :stas -> "stas"
-          :stas_btg -> "stas"
-          :stas3 -> "stas3"
-          _ -> nil
-        end
-
       tampered? =
-        script_type == :stas3 and
-          stas3_post_op_return_tampered?(token_id, script_binary)
+        script_type == :stas3 and stas3_post_op_return_tampered?(token_id, script_binary)
 
-      cond do
-        tampered? ->
-          Logger.warning(
-            "STAS3 post-OP_RETURN mismatch for protoID=#{token_id} tx=#{txid_hex} vout=#{vout}; skipping output indexing per spec §4 byte-identity invariant"
-          )
+      if tampered? do
+        Logger.warning(
+          "STAS3 post-OP_RETURN mismatch for protoID=#{token_id} tx=#{txid_hex} vout=#{vout}; skipping output indexing per spec §4 byte-identity invariant"
+        )
 
-        true ->
-          # `token_id` from `Classifier.classify_outputs/1` is the protoID
-          # the SCRIPT self-asserts. The lineage-checked tag computed in
-          # `compute_stas_attributes/2` (issuance gate + transfer
-          # inheritance + illegal-root taint) overrides it. If the script
-          # isn't STAS-templated, `token_id_per_vout[vout]` is `nil`.
-          effective_token_id = Map.get(stas_attrs.token_id_per_vout, vout)
+        :ok
+      else
+        # `token_id` from `Classifier.classify_outputs/1` is the protoID the SCRIPT
+        # self-asserts. The lineage-checked tag from `compute_stas_attributes/2`
+        # (issuance gate + transfer inheritance + illegal-root taint) overrides it;
+        # `nil` when the script isn't STAS-templated.
+        utxo_attrs = %{
+          txid: txid_binary,
+          vout: vout,
+          address: script_address(output.locking_script),
+          satoshis: output.satoshis,
+          script_hex: Base.encode16(script_binary, case: :lower),
+          token_id: Map.get(stas_attrs.token_id_per_vout, vout),
+          token_type: output_token_type(script_type),
+          is_spent: false,
+          block_height: block_height
+        }
 
-          utxo_attrs = %{
-            txid: txid_binary,
-            vout: vout,
-            address: address,
-            satoshis: output.satoshis,
-            script_hex: Base.encode16(script_binary, case: :lower),
-            token_id: effective_token_id,
-            token_type: token_type,
-            is_spent: false,
-            block_height: block_height
-          }
-
-          case UtxoManager.create_utxo(utxo_attrs) do
-            {:ok, _} ->
-              :ok
-
-            {:error, %Ecto.Changeset{} = cs} ->
-              Logger.warning(
-                "UTXO insert rejected for #{txid_hex} vout=#{vout}: " <>
-                  inspect(cs.errors)
-              )
-          end
-
-          if script_type == :stas3 do
-            seed_watching_token_metadata(token_id, script_binary)
-          end
+        with :ok <- required_write(UtxoManager.create_utxo(utxo_attrs)) do
+          # Best-effort metadata seeding (watching-token canonical bytes) — not part of
+          # the per-block application contract.
+          if script_type == :stas3, do: seed_watching_token_metadata(token_id, script_binary)
+          :ok
+        end
       end
     end)
+  end
 
-    # 4. Record address history. One directional row per watched address
-    # involved in the tx — received (`in`, output side) or sent (`out`,
-    # input side). The filter's `matched_addresses` only covers P2PKH
-    # outputs, so we additionally resolve:
-    #   * STAS 3.0 owner addresses on outputs (filter can't extract them)
-    #   * input-side senders from the spent UTXOs (filter never scans inputs)
-    # `matched_addresses` is kept as a trusted seed so the set is never
-    # smaller than what the filter already matched.
+  defp output_token_type(:stas), do: "stas"
+  defp output_token_type(:stas_btg), do: "stas"
+  defp output_token_type(:stas3), do: "stas3"
+  defp output_token_type(_), do: nil
+
+  # 4. Record address history. One directional row per watched address involved in the
+  # tx — received (`in`, output side) or sent (`out`, input side). The filter's
+  # `matched_addresses` only covers P2PKH outputs, so we additionally resolve STAS 3.0
+  # owner addresses on outputs and input-side senders from the spent UTXOs.
+  # `matched_addresses` is a trusted seed so the set is never smaller than the filter's.
+  # A failed history insert fails the block closed.
+  defp record_history(tx, matched_addresses, stas_attrs, block_height, txid_hex) do
     spent_utxos = stas_attrs.parent_outputs |> Map.values() |> Enum.reject(&is_nil/1)
     watched = watched_address_set()
 
@@ -317,7 +355,7 @@ defmodule Athanor.Indexer.TransactionProcessor do
 
     history_addresses = Enum.uniq(matched_addresses ++ extra_addresses)
 
-    Enum.each(history_addresses, fn address ->
+    reduce_writes(history_addresses, fn address ->
       direction = determine_direction(tx, address)
       {satoshis, token_id} = address_flow(tx, address, direction, spent_utxos, stas_attrs)
 
@@ -331,12 +369,16 @@ defmodule Athanor.Indexer.TransactionProcessor do
         timestamp: System.os_time(:second)
       }
 
-      %AddressHistory{}
-      |> AddressHistory.changeset(history_attrs)
-      |> Repo.insert()
+      required_write(
+        %AddressHistory{}
+        |> AddressHistory.changeset(history_attrs)
+        |> Repo.insert()
+      )
     end)
+  end
 
-    # 5. Publish events via PubSub
+  # 5. Publish events via PubSub (best-effort notification, no DB writes).
+  defp publish_events(matched_addresses, txid_hex) do
     Enum.each(matched_addresses, fn address ->
       Phoenix.PubSub.broadcast(
         Athanor.PubSub,
@@ -350,16 +392,6 @@ defmodule Athanor.Indexer.TransactionProcessor do
         {:balance_changed, %{address: address}}
       )
     end)
-
-    Logger.info(
-      "Indexed tx #{txid_hex} (#{length(matched_addresses)} addrs, #{length(matched_tokens)} tokens)"
-    )
-
-    # If any prior tx was deferred waiting on this txid as a parent,
-    # re-run their lineage now. Cascades transitively for chains.
-    reprocess_waiters(txid_hex)
-
-    {:ok, txid_hex}
   end
 
   # Find every MetaTransaction whose `metadata["missing_transactions"]`

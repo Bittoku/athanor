@@ -344,5 +344,74 @@ defmodule Athanor.Indexer.BlockProcessorApplyBranchTest do
     end
   end
 
+  describe "block-indexing writes are checked + classified (note-1069 B1)" do
+    test "required_write/1: success and benign :not_found pass; a real error fails closed" do
+      # The gate that ALL block-indexing writes (spend_utxo/set_stas3_op/create_utxo/
+      # union_source_only/AddressHistory) pass through: a missing watched UTXO is benign,
+      # any other error fails the block closed.
+      assert :ok = TransactionProcessor.required_write({:ok, :whatever})
+      assert :ok = TransactionProcessor.required_write({:error, :not_found})
+      assert {:error, :db_down} = TransactionProcessor.required_write({:error, :db_down})
+
+      assert {:error, %Ecto.Changeset{}} =
+               TransactionProcessor.required_write({:error, %Ecto.Changeset{}})
+    end
+
+    test "a matched tx that spends an UNWATCHED parent still indexes (benign :not_found)" do
+      # The tx's input spends a random (unwatched) UTXO → spend_utxo returns
+      # {:error, :not_found}, which must NOT fail the block: the tx indexes fully and
+      # record_block/4 commits both the side effects and the context.
+      pkh = :binary.copy(<<0x57>>, 20)
+      address = BSV.Base58.check_encode(pkh, 0x00)
+      tx = p2pkh_tx(pkh)
+
+      index_fun = fn _t, _h, _bh ->
+        case TransactionProcessor.index_tx(tx, [address], [], :block) do
+          {:ok, _} -> :ok
+          err -> err
+        end
+      end
+
+      assert {:ok, 305} =
+               BlockProcessor.record_block("blk-305", 305, ["t"], index_fun: index_fun)
+
+      assert Repo.aggregate(MetaTransaction, :count) == 1
+      assert Repo.aggregate(Utxo, :count) == 1
+      assert Repo.get(BlockProcessContext, "blk-305").height == 305
+    end
+  end
+
+  describe "rollback is fail-closed and result-checked (note-1069 B2)" do
+    test "a failed rollback returns {:error}, leaves last_height unchanged, and skips connect" do
+      Repo.insert!(%BlockProcessContext{id: "h100", height: 100, processed_at: now()})
+
+      proc =
+        start_supervised!({
+          BlockProcessor,
+          rollback_fun: fn _height -> {:error, :db_down} end,
+          process_fun: fn _hash, _state ->
+            flunk("connect must not run after a failed rollback")
+          end
+        })
+
+      assert {:error, {:rollback_failed, :db_down}} =
+               BlockProcessor.apply_branch(proc, %{rollback_to: 50, connect: [<<1, 0::248>>]})
+
+      # The durable tip is untouched and `last_height` was not lowered to the fork.
+      assert BlockProcessor.last_processed_height() == 100
+      refute is_nil(Repo.get(BlockProcessContext, "h100"))
+    end
+
+    test "rollback_to/1 runs in one transaction and returns :ok" do
+      Repo.insert!(%BlockProcessContext{id: "h100", height: 100, processed_at: now()})
+      Repo.insert!(%BlockProcessContext{id: "h101", height: 101, processed_at: now()})
+
+      assert :ok = BlockProcessor.rollback_to(100)
+
+      assert is_nil(Repo.get(BlockProcessContext, "h101"))
+      refute is_nil(Repo.get(BlockProcessContext, "h100"))
+    end
+  end
+
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:second)
 end

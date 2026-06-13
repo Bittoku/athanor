@@ -100,7 +100,18 @@ defmodule Athanor.Indexer.BlockProcessor do
     # per-block connect step; injectable so unit tests can drive a slow/refusing
     # processor without RPC. Defaults to the real block processor.
     process_fun = Keyword.get(opts, :process_fun, &process_connect/2)
-    {:ok, %{last_height: last_height, processing: false, process_fun: process_fun}}
+    # `:rollback_fun` (height -> :ok | {:error, reason}) is the reorg rollback step;
+    # injectable so a regression can drive a failing rollback. Defaults to the real
+    # transactional `rollback_to/1`.
+    rollback_fun = Keyword.get(opts, :rollback_fun, &rollback_to/1)
+
+    {:ok,
+     %{
+       last_height: last_height,
+       processing: false,
+       process_fun: process_fun,
+       rollback_fun: rollback_fun
+     }}
   end
 
   @impl true
@@ -141,20 +152,38 @@ defmodule Athanor.Indexer.BlockProcessor do
   end
 
   def handle_call({:apply_branch, rollback_to, connect_hashes}, _from, state) do
-    {mutated?, state} =
-      if is_integer(rollback_to) do
-        Logger.warning("BlockProcessor: rolling back to height #{rollback_to}")
-        rollback_to(rollback_to)
-        {true, %{state | last_height: rollback_to, processing: false}}
-      else
-        {false, state}
-      end
+    case apply_rollback(state, rollback_to) do
+      {:error, reason} ->
+        # The rollback failed before any connect work → fail closed: do NOT lower
+        # `last_height` or connect; report the failure through the result contract
+        # (note-1069 B2) so the controller defers rather than treating it as applied.
+        {:reply, {:error, {:rollback_failed, reason}}, state}
 
-    {result, state} =
-      connect_branch(connect_hashes, state, mutated?: mutated?, process_fun: state.process_fun)
+      {:ok, mutated?, state} ->
+        {result, state} =
+          connect_branch(connect_hashes, state,
+            mutated?: mutated?,
+            process_fun: state.process_fun
+          )
 
-    {:reply, result, state}
+        {:reply, result, state}
+    end
   end
+
+  # Run the reconcile-supplied rollback (if any) through the fail-closed contract:
+  # `last_height` drops to the fork height ONLY after a successful, transactional
+  # rollback; a failure propagates so the caller does not claim a rollback that did
+  # not durably happen (note-1069 B2).
+  defp apply_rollback(state, rollback_to) when is_integer(rollback_to) do
+    Logger.warning("BlockProcessor: rolling back to height #{rollback_to}")
+
+    case state.rollback_fun.(rollback_to) do
+      :ok -> {:ok, true, %{state | last_height: rollback_to, processing: false}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp apply_rollback(state, _no_rollback), do: {:ok, false, state}
 
   # The public `{:process_block_hash, …}` mutation cast is **removed** (note-1035 B1):
   # a named-GenServer cast is externally reachable and would bypass the predecessor
@@ -476,7 +505,21 @@ defmodule Athanor.Indexer.BlockProcessor do
 
   Transactions at or below `height` are left untouched.
   """
+  @spec rollback_to(non_neg_integer()) :: :ok | {:error, term()}
   def rollback_to(height) do
+    # Fail-closed contract (note-1069 B2): the rollback's several statements run in ONE
+    # transaction and the result is checked, so a mid-rollback DB error rolls the whole
+    # rollback back and is reported as `{:error, _}` — the caller must not then claim the
+    # rollback (and `last_height`) succeeded.
+    case Repo.transaction(fn -> do_rollback_to(height) end) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e -> {:error, {:rollback_exception, Exception.message(e)}}
+  end
+
+  defp do_rollback_to(height) do
     Logger.warning("Rolling back to height #{height}")
 
     # Capture the orphaned txids BEFORE the un-confirm below clears the
@@ -509,6 +552,8 @@ defmodule Athanor.Indexer.BlockProcessor do
     Utxo
     |> where([u], u.block_height > ^height)
     |> Repo.update_all(set: [block_height: nil])
+
+    :ok
   end
 
   defp get_last_processed_height do
