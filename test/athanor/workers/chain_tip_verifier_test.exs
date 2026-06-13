@@ -144,6 +144,19 @@ defmodule Athanor.Workers.ChainTipVerifierTest do
       refute ChainTipVerifier.chain_tip_p2p_active?(p2p_available?: false)
     end
 
+    test "chain_tip_p2p_active?/1 requires the route PRIMARY to be :p2p (override respected, note 963 B1)" do
+      # An operator override making RPC the primary chain-tip authority with P2P as
+      # a fallback must NOT read as P2P-active, even with peers live — otherwise the
+      # RPC-primary override is silently disabled.
+      Application.put_env(:athanor, Athanor.P2P.SourceRouter,
+        routes: %{chain_tip: {:rpc, [:p2p]}}
+      )
+
+      on_exit(fn -> Application.delete_env(:athanor, Athanor.P2P.SourceRouter) end)
+
+      refute ChainTipVerifier.chain_tip_p2p_active?(p2p_available?: true)
+    end
+
     test "should_defer_to_p2p?/2 is false while suspended even if peers are live (blocker 2)" do
       assert ChainTipVerifier.should_defer_to_p2p?(false, p2p_available?: true)
       refute ChainTipVerifier.should_defer_to_p2p?(true, p2p_available?: true)

@@ -141,27 +141,30 @@ defmodule Athanor.Workers.ChainTipVerifier do
 
   @doc """
   Whether the P2P `HeadersChain` is the **active** tip authority right now — i.e.
-  the `:chain_tip` route's primary is `:p2p` *and* P2P is available. Reuses
-  `SourceRouter`'s exact availability gate (so there is one definition of
-  "P2P is up"). When false, the RPC poll is the authority (cold-start parity).
+  the `:chain_tip` route's **primary** provider is `:p2p` *and* P2P is available.
+
+  The primary check is explicit (`SourceRouter.resolve/1`): `SourceRouter.route/3`
+  would fall through to a `:p2p` *fallback* once peers are live, so an operator
+  override like `chain_tip: {:rpc, [:p2p]}` (RPC-primary, P2P fallback) must NOT
+  read as P2P-active — otherwise the RPC-primary override is silently disabled
+  (Hermes !18 note 963 B1). Availability reuses `SourceRouter`'s exact gate (one
+  definition of "P2P is up"). When false, the RPC poll is the authority.
 
   `opts` accepts `:p2p_available?` (a boolean or 0-arity fun), forwarded to
   `SourceRouter.route/3`.
   """
   @spec chain_tip_p2p_active?(keyword()) :: boolean()
   def chain_tip_p2p_active?(opts \\ []) do
-    match?(
-      {:ok, :p2p},
-      SourceRouter.route(
-        :chain_tip,
-        fn
-          :p2p -> {:ok, :p2p}
-          _ -> :miss
-        end,
-        opts
-      )
-    )
+    with {:p2p, _fallbacks} <- SourceRouter.resolve(:chain_tip),
+         {:ok, :p2p} <- SourceRouter.route(:chain_tip, &chain_tip_p2p_attempt/1, opts) do
+      true
+    else
+      _ -> false
+    end
   end
+
+  defp chain_tip_p2p_attempt(:p2p), do: {:ok, :p2p}
+  defp chain_tip_p2p_attempt(_provider), do: :miss
 
   @doc """
   Whether the RPC poll should defer active catch-up to P2P: only when P2P is the

@@ -180,13 +180,23 @@ defmodule Athanor.P2P.HeadersChainTest do
              Enum.map([b1, b2, b3], &Hash.wire_to_display(BlockHeader.hash(&1)))
   end
 
-  test "persistent detached headers escalate to {:reorg_too_deep} after max_detached_rounds" do
+  # Solicit a getheaders to `peer` by advertising a block inv (the legitimate
+  # chain-discovery flow), so its subsequent detached reply is counted.
+  defp solicit(hc, peer) do
+    send(hc, {:peer, peer, :frame, inv_block(:binary.copy(<<0xBB>>, 32))})
+    _ = :sys.get_state(hc)
+    :ok
+  end
+
+  test "persistent SOLICITED detached headers escalate to {:reorg_too_deep} after max_detached_rounds" do
     setup_registry()
     {peer, _sock} = ready_peer()
     register(peer, 1)
     hc = start_hc(max_detached_rounds: 2)
 
-    # Headers whose parent is unknown (a below-window fork) → detached each round.
+    # Our getheaders (triggered by the peer's block inv) makes the detached reply a
+    # legitimate response; the re-request after each detached keeps the flow open.
+    solicit(hc, peer)
     detached = chain(:binary.copy(<<0x99>>, 32), 1)
 
     send(hc, {:peer, peer, :frame, headers_frame(detached)})
@@ -197,7 +207,25 @@ defmodule Athanor.P2P.HeadersChainTest do
     assert_receive {:tip, {:reorg_too_deep, _}}
   end
 
-  test "detached tracking is scoped per peer: one detached batch from each of two peers does not escalate" do
+  test "UNSOLICITED unknown-parent headers from one peer do NOT escalate (note 963 B2)" do
+    setup_registry()
+    {peer, _sock} = ready_peer()
+    register(peer, 1)
+    hc = start_hc(max_detached_rounds: 2)
+
+    # No getheaders was sent to this peer — these headers are unsolicited junk.
+    # A single peer must not be able to force a global deep-reorg suspension.
+    detached = chain(:binary.copy(<<0x99>>, 32), 1)
+
+    send(hc, {:peer, peer, :frame, headers_frame(detached)})
+    _ = :sys.get_state(hc)
+    send(hc, {:peer, peer, :frame, headers_frame(detached)})
+    _ = :sys.get_state(hc)
+
+    refute_received {:tip, {:reorg_too_deep, _}}
+  end
+
+  test "solicited detached tracking is scoped per peer: one each from two peers does not escalate" do
     setup_registry()
     {p1, _s1} = ready_peer()
     {p2, _s2} = ready_peer()
@@ -205,8 +233,8 @@ defmodule Athanor.P2P.HeadersChainTest do
     register(p2, 2)
     hc = start_hc(max_detached_rounds: 2)
 
-    # A below-window fork (unknown parent) → detached. Sent once from each distinct
-    # peer; neither peer alone reaches the threshold, so no authority suspension.
+    solicit(hc, p1)
+    solicit(hc, p2)
     detached = chain(:binary.copy(<<0x99>>, 32), 1)
 
     send(hc, {:peer, p1, :frame, headers_frame(detached)})
@@ -223,6 +251,8 @@ defmodule Athanor.P2P.HeadersChainTest do
     register(peer, 1)
     hc = start_hc(max_detached_rounds: 2)
 
+    solicit(hc, peer)
+
     # One batch that BOTH extends the tip (off the seed) and carries a detached
     # junk header (unknown parent). Progress must reset detached tracking.
     [e1, e2] = chain(@seed, 2)
@@ -230,33 +260,10 @@ defmodule Athanor.P2P.HeadersChainTest do
     send(hc, {:peer, peer, :frame, headers_frame([e1, e2, junk])})
     assert_receive {:tip, {:extend, _}}
 
-    # A second identical batch — still only one *new* detached round at most, so
-    # with the progress reset it never reaches max_detached_rounds.
+    # Re-solicit and send the junk again — only one fresh round, so threshold 2 is
+    # never reached because the progress reset cleared the count.
+    solicit(hc, peer)
     send(hc, {:peer, peer, :frame, headers_frame([junk])})
-    _ = :sys.get_state(hc)
-    refute_received {:tip, {:reorg_too_deep, _}}
-  end
-
-  test "progress between detached batches resets the per-peer counter" do
-    setup_registry()
-    {peer, _sock} = ready_peer()
-    register(peer, 1)
-    hc = start_hc(max_detached_rounds: 2)
-
-    detached = chain(:binary.copy(<<0x99>>, 32), 1)
-
-    # Round 1 of detached.
-    send(hc, {:peer, peer, :frame, headers_frame(detached)})
-    _ = :sys.get_state(hc)
-    refute_received {:tip, {:reorg_too_deep, _}}
-
-    # A valid extend resets detached tracking.
-    [e1] = chain(@seed, 1)
-    send(hc, {:peer, peer, :frame, headers_frame([e1])})
-    assert_receive {:tip, {:extend, _}}
-
-    # The next detached is round 1 again, not 2 → no escalation at threshold 2.
-    send(hc, {:peer, peer, :frame, headers_frame(detached)})
     _ = :sys.get_state(hc)
     refute_received {:tip, {:reorg_too_deep, _}}
   end

@@ -149,8 +149,17 @@ defmodule Athanor.P2P.HeadersChain.IntegrationTest do
   test "a persistently-detached run escalates to reorg_too_deep over real sockets" do
     server = start_p2p(max_detached_rounds: 2)
 
+    # Solicit: advertise a block inv so our HeadersChain issues a getheaders. Only a
+    # *solicited* detached reply counts toward escalation (note 963 B2).
+    send(server, {:cmd, {:inv_block, :binary.copy(<<0xBB>>, 32)}})
+
+    eventually(fn ->
+      MapSet.size(:sys.get_state(Process.whereis(HeadersChain)).pending_getheaders) == 1
+    end)
+
     # A header whose parent is neither the seed nor in the tree — a fork below the
-    # retained window. Re-delivered, it stays detached each round.
+    # retained window. Re-delivered, it stays detached each round; the re-request
+    # after round 1 keeps the flow solicited.
     [orphan_header] = chain(:binary.copy(<<0x99>>, 32), 1, 7)
     body = headers_body([orphan_header])
 

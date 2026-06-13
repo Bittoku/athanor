@@ -17,10 +17,15 @@ defmodule Athanor.P2P.HeadersChain do
       already bounded; malformed/oversize dropped) and folded `{:connect, …}`
       through the `Tree`. `{:extend, …}`/`{:reorg, …}` are surfaced to the injected
       `:on_tip` sink with **display-order** hashes and reset the detached counter.
-      A `{:detached, …}` run re-issues `getheaders` and increments the counter;
-      after `:max_detached_rounds` consecutive detached rounds the fork is deeper
-      than the window, so `:on_tip` is signalled `{:reorg_too_deep, …}` (operator
-      alert + RPC fallback, §C) and the counter resets.
+      A `{:detached, …}` run re-issues `getheaders` and increments a counter that
+      is **scoped to a single peer's solicited fork-discovery flow** — it only
+      counts detached headers that answer a `getheaders` we sent that peer, ignores
+      unsolicited junk, and resets on progress or a peer change. After
+      `:max_detached_rounds` consecutive solicited detached rounds from the same
+      peer the fork is deeper than the window, so `:on_tip` is signalled
+      `{:reorg_too_deep, …}` (operator alert + RPC fallback, §C) and the counter
+      resets. This prevents one peer from forcing a global authority suspension
+      with unauthenticated headers.
     * **`:tick`** → periodic `:prune` + an opportunistic `getheaders`.
 
   Fail-closed (Phase-5 consistency): every external call (`PeerRegistry.pids/1`,
@@ -84,7 +89,8 @@ defmodule Athanor.P2P.HeadersChain do
       tree_opts: build_tree_opts(opts),
       detached_rounds: 0,
       detached_peer: nil,
-      last_getheaders: %{}
+      last_getheaders: %{},
+      pending_getheaders: MapSet.new()
     }
 
     schedule_tick(state.tick_interval_ms)
@@ -114,8 +120,14 @@ defmodule Athanor.P2P.HeadersChain do
       when not is_nil(tree) do
     case Headers.parse(payload) do
       {:ok, headers, _rest} when headers != [] ->
+        # A `headers` frame answers (and clears) any outstanding `getheaders` we
+        # sent this peer. Only a **solicited** reply may count toward the detached
+        # deep-reorg escalation (note 963 B2) — unsolicited junk is ignored there.
+        solicited? = MapSet.member?(state.pending_getheaders, pid)
+        state = %{state | pending_getheaders: MapSet.delete(state.pending_getheaders, pid)}
+
         {tree, events} = Tree.step(state.tree, {:connect, headers})
-        {:noreply, apply_events(events, pid, %{state | tree: tree})}
+        {:noreply, apply_events(events, pid, solicited?, %{state | tree: tree})}
 
       _ ->
         {:noreply, state}
@@ -142,7 +154,7 @@ defmodule Athanor.P2P.HeadersChain do
 
   ## ── Tip-event handling ──
 
-  defp apply_events(events, source_pid, state) do
+  defp apply_events(events, source_pid, solicited?, state) do
     # A batch that advanced the best tip is *progress* — a `{:detached, …}` carried
     # in the same batch (junk headers riding alongside real ones) must NOT count
     # against the deep-reorg counter (Hermes !18 note 941). Tip events also reset
@@ -150,28 +162,41 @@ defmodule Athanor.P2P.HeadersChain do
     progressed? =
       Enum.any?(events, &match?({:extend, _}, &1)) or Enum.any?(events, &match?({:reorg, _}, &1))
 
-    Enum.reduce(events, state, fn event, st -> apply_event(event, source_pid, progressed?, st) end)
+    Enum.reduce(events, state, fn event, st ->
+      apply_event(event, source_pid, progressed?, solicited?, st)
+    end)
   end
 
-  defp apply_event({:extend, hashes}, _source, _progressed?, state) do
+  defp apply_event({:extend, hashes}, _source, _progressed?, _solicited?, state) do
     notify_tip(state, {:extend, display(hashes)})
     reset_detached(state)
   end
 
-  defp apply_event({:reorg, %{orphan: orphan, connect: connect}}, _source, _progressed?, state) do
+  defp apply_event(
+         {:reorg, %{orphan: orphan, connect: connect}},
+         _source,
+         _progressed?,
+         _solicited?,
+         state
+       ) do
     notify_tip(state, {:reorg, %{orphan: display(orphan), connect: display(connect)}})
     reset_detached(state)
   end
 
   # Detached headers in a batch that also advanced the tip are ignored — progress
   # proves the chain is bridgeable, so this is not an unbridgeable-fork signal.
-  defp apply_event({:detached, _count}, _source, true, state), do: state
+  defp apply_event({:detached, _count}, _source, true, _solicited?, state), do: state
 
-  # Detached with no progress. The round counter is **scoped to a single peer**: a
-  # detached run only escalates when the *same* peer keeps failing to bridge across
-  # consecutive rounds, so junk from assorted peers can never accumulate to suspend
-  # P2P authority (Hermes !18 note 941). A new peer restarts the count at 1.
-  defp apply_event({:detached, _count}, source_pid, false, state) do
+  # Unsolicited detached headers (not a response to a `getheaders` we sent this
+  # peer) are ignored for escalation — a single peer must not be able to force a
+  # global deep-reorg suspension with unauthenticated junk (Hermes !18 note 963 B2).
+  defp apply_event({:detached, _count}, _source, false, false, state), do: state
+
+  # Solicited detached with no progress. The round counter is **scoped to a single
+  # peer's fork-discovery flow**: it only escalates when the *same* peer keeps
+  # answering our re-requests with unbridgeable headers across consecutive rounds
+  # (note 941 per-peer scoping + note 963 solicited gate). A new peer restarts at 1.
+  defp apply_event({:detached, _count}, source_pid, false, true, state) do
     rounds = if state.detached_peer == source_pid, do: state.detached_rounds + 1, else: 1
 
     if rounds >= state.max_detached_rounds do
@@ -183,8 +208,8 @@ defmodule Athanor.P2P.HeadersChain do
       notify_tip(state, {:reorg_too_deep, %{rounds: rounds, peer: inspect(source_pid)}})
       reset_detached(state)
     else
-      # Re-request from that peer (it claims to have the chain), tracking it as the
-      # current fork candidate.
+      # Re-request from that peer (it claims to have the chain), keeping the flow
+      # solicited and tracking it as the current fork candidate.
       %{
         send_getheaders(state, source_pid, true)
         | detached_rounds: rounds,
@@ -193,7 +218,7 @@ defmodule Athanor.P2P.HeadersChain do
     end
   end
 
-  defp apply_event(_event, _source, _progressed?, state), do: state
+  defp apply_event(_event, _source, _progressed?, _solicited?, state), do: state
 
   defp reset_detached(state), do: %{state | detached_rounds: 0, detached_peer: nil}
 
@@ -216,7 +241,13 @@ defmodule Athanor.P2P.HeadersChain do
         Headers.serialize_get_headers(state.version, locator, <<0::256>>)
       )
 
-      %{state | last_getheaders: Map.put(state.last_getheaders, pid, now)}
+      # Mark this peer as having an outstanding request, so its next `headers`
+      # reply is treated as solicited (note 963 B2). Cleared when that reply lands.
+      %{
+        state
+        | last_getheaders: Map.put(state.last_getheaders, pid, now),
+          pending_getheaders: MapSet.put(state.pending_getheaders, pid)
+      }
     end
   end
 

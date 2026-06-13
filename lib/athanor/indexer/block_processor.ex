@@ -257,21 +257,16 @@ defmodule Athanor.Indexer.BlockProcessor do
     end)
   end
 
-  @doc """
-  Reorg detection + **no-gap predecessor guard** for a block at `height` whose
-  parent is `prev_hash` (Hermes !18 note 945 B3).
-
-    * predecessor context present and matching → `:ok` (chain consistent);
-    * predecessor context present but a different hash → reorg: roll back below it,
-      then `:ok`;
-    * predecessor context **missing**:
-      * on an **empty** index → `:ok` (the genuine first block being indexed has no
-        predecessor to expect);
-      * on a **non-empty** index → `{:error, :missing_predecessor}`: recording this
-        block would leave a gap (its parent was never processed), so it is refused.
-
-  `@doc false` — public only so the no-gap guard is unit-testable.
-  """
+  # Reorg detection + no-gap predecessor guard for a block at `height` whose parent
+  # is `prev_hash` (Hermes !18 note 945 B3):
+  #   * predecessor context present and matching -> :ok (chain consistent);
+  #   * predecessor context present but a different hash -> reorg: roll back below
+  #     it, then :ok;
+  #   * predecessor context missing:
+  #       - on an EMPTY index -> :ok (the genuine first block has no predecessor);
+  #       - on a NON-EMPTY index -> {:error, :missing_predecessor}: recording this
+  #         block would leave a gap (its parent was never processed) -> refused.
+  # Public (but `@doc false`) only so the no-gap guard is unit-testable.
   @doc false
   @spec maybe_handle_reorg(binary() | nil, non_neg_integer()) ::
           :ok | {:error, :missing_predecessor}
