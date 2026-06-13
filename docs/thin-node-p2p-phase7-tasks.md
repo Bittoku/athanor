@@ -54,9 +54,12 @@ correctness precondition for F7.2. (Resolves note-1018 blocker 1.)
 ## 2. Core design — one authority, many hints
 
 A single owner, **`Athanor.Indexer.TipController`** (GenServer), owns the index tip. It
-runs RPC **reconcile cycles** that are the only thing that mutates the index. A cycle is
-triggered by either the periodic poll **or** a *hint* from any realtime producer; hints
-are coalesced (debounced) so a burst triggers one cycle.
+**replaces the existing `Athanor.Workers.ChainTipVerifier` RPC poller** (whose poll +
+catch-up role it subsumes — see §4): after this phase `ChainTipVerifier` is gone from the
+supervision tree, so the periodic RPC poll and every realtime producer share the one
+controller. The controller runs RPC **reconcile cycles** that are the only thing that
+mutates the index. A cycle is triggered by either the periodic poll **or** a *hint* from
+any realtime producer; hints are coalesced (debounced) so a burst triggers one cycle.
 
 ```
 producers (advisory hints)                 authority (mutation)
@@ -139,10 +142,23 @@ remainder); `:error`/`:defer` → stay, retry next tick. (Resolves note-1018 blo
 
 ---
 
-## 4. Producer model — hints only (sub-requirement 8; note-1018 blocker 2)
+## 4. Producer model — hints only; the legacy RPC poller is retired (sub-requirement 8; note-1018 B2; note-1027 B1)
 
-Every realtime producer is converted to a **hint** to the controller; **none** casts to
-`BlockProcessor` directly any more (that is now I4-illegal):
+There is exactly **one** index-tip mutation owner — `TipController` — and **every** other
+path that currently casts into `BlockProcessor` is either subsumed into the controller or
+converted to a hint. After this phase, nothing but `TipController.apply_branch/2` writes
+`block_process_contexts` (I2/I4).
+
+**Retired / subsumed (the existing RPC poller):**
+
+- **`Athanor.Workers.ChainTipVerifier`** is the current RPC tip poller and **itself casts
+  straight into `BlockProcessor`** (`lib/athanor/workers/chain_tip_verifier.ex:44-46`,
+  `:93-95`). Its RPC-poll + catch-up role **is** the `TipController` reconcile cycle (§3),
+  so it is **removed from the application supervision tree** and replaced by `TipController`
+  — there is no separate RPC poller left casting to `BlockProcessor`. (Resolves
+  note-1027 B1: a single mutation owner; the RPC poll cannot bypass `apply_branch/2`.)
+
+**Converted to advisory hints (no direct cast):**
 
 - **`HeadersChain` `:on_tip`** → `TipController.hint(:p2p, candidate_tip_hash)`. Replaces
   the Phase 6 detection-only logger.
@@ -152,13 +168,16 @@ Every realtime producer is converted to a **hint** to the controller; **none** c
   `lib/athanor/blockchain/jungle_bus_client.ex:174-183`) → `TipController.hint(:junglebus, hash)`.
 
 A hint never mutates the index; it only (debounced) schedules a reconcile cycle, which
-applies **only** the RPC-confirmed branch. Acceptance tests prove a ZMQ/JungleBus/P2P
-hint during an in-flight handoff/recovery cannot write `block_process_contexts` except
-through the controller's RPC-confirmed `apply_branch/2`. (Resolves note-1018 blocker 2.)
+applies **only** the RPC-confirmed branch. Acceptance tests prove (a) the supervision tree
+has exactly one index-tip mutation owner (no `ChainTipVerifier`), and (b) a
+ZMQ/JungleBus/P2P hint — or the RPC poll — during an in-flight handoff/recovery cannot
+write `block_process_contexts` except through `apply_branch/2`. (Resolves note-1018 B2 +
+note-1027 B1.)
 
 > The existing `BlockProcessor.handle_cast({:process_block_hash, …})` is retained only as
 > the controller's internal connect primitive (called from `apply_branch`’s reduce); the
-> public out-of-band cast entry points from ZMQ/JungleBus are removed in T7.S.
+> public out-of-band cast entry points (ZMQ, JungleBus, and the legacy `ChainTipVerifier`
+> poll) are removed in T7.S.
 
 ---
 
@@ -198,6 +217,7 @@ no-gap invariant (I1) is total.
 | note-1018 B1 (DAA dependency) | §1.1 advisory-until-RPC-confirmed → F7.2 ⊥ F7.1 |
 | note-1018 B2 (ZMQ/JBus) | §4 producers become hints; out-of-band casts removed |
 | note-1018 B3 (async apply) | §3b synchronous result contract |
+| note-1027 B1 (legacy RPC poller) | §2 + §4 — `ChainTipVerifier` retired/subsumed by `TipController`; single mutation owner (T7.S) |
 
 ---
 
@@ -228,11 +248,15 @@ no-gap invariant (I1) is total.
   `{:partial}`/failed-first-block leave authority state + replay correct; the deferred-tip
   case (index below node, hint arrives, reconcile catches up without a new announcement —
   acceptance (a)).
-- **T7.S — wiring + bootstrap + producer cutover.** Persisted `IndexerBootstrap`; wire
-  `HeadersChain` `:on_tip` → `TipController.hint`; **remove** the out-of-band
-  `BlockProcessor` casts from `ZmqListener`/`JungleBusClient`, routing them to
-  `TipController.hint`; start `TipController`. Tests: bootstrap row captured once + stable;
-  ZMQ/JungleBus events reach the controller as hints and do not write contexts directly.
+- **T7.S — wiring + bootstrap + producer cutover (incl. RPC-poller retirement).** Persisted
+  `IndexerBootstrap`; wire `HeadersChain` `:on_tip` → `TipController.hint`; **remove** the
+  out-of-band `BlockProcessor` casts from `ZmqListener`/`JungleBusClient`, routing them to
+  `TipController.hint`; **remove `Athanor.Workers.ChainTipVerifier` from the application
+  supervision tree** (its RPC poll role is the controller's reconcile cycle); start
+  `TipController`. Tests: bootstrap row captured once + stable; ZMQ/JungleBus events reach
+  the controller as hints and do not write contexts directly; **the app supervision tree
+  contains exactly one index-tip mutation owner (`TipController`, no `ChainTipVerifier`)**
+  and the RPC poll cannot bypass `apply_branch/2` (note-1027 B1).
 - **T7.4 — integration (real sockets, `async: false`).** A fork over loopback drives a
   hint; the controller reconciles against an injected RPC node and applies; assert
   `block_process_contexts` stays contiguous (I1) across extend / higher-work reorg /
@@ -252,6 +276,9 @@ no-gap invariant (I1) is total.
   applied (T7.3/T7.4); (B2) ZMQ/JungleBus cannot bypass the controller (T7.S/T7.4);
   (B3) `apply_branch` result contract drives authority state, with `{:partial}`/
   failed-first-block tests (T7.1/T7.3).
+- note-1027 (B1): the application supervision tree has exactly **one** index-tip mutation
+  owner — `TipController`, with `ChainTipVerifier` removed — and neither the RPC poll nor
+  any producer can write `block_process_contexts` except through `apply_branch/2` (T7.S/T7.4).
 - The reused MR !18 matrix (reconcile, serialized apply, no-gap, last_height) green.
 - Full `mix test` clean; warnings-clean (bsv_sdk dep excepted); format fixpoint under the
   1.15.7 import_deps toolchain **and** `mix format --check-formatted`; no
