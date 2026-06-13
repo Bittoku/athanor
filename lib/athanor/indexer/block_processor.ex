@@ -285,13 +285,17 @@ defmodule Athanor.Indexer.BlockProcessor do
         :ok
 
       %{id: stored_hash} ->
-        # Reorg detected!
+        # Reorg detected: the orphaned branch is rolled back below the divergence,
+        # but the current child is REFUSED (note 979 B2). After the rollback its
+        # predecessor context is gone, so recording it now would leave a gap; the
+        # canonical ancestor→tip branch must be reprocessed through the ordered
+        # reorg/catch-up path (which fetches it contiguously) first.
         Logger.warning(
           "REORG detected at height #{expected_height}: expected #{prev_hash}, have #{stored_hash}"
         )
 
         rollback_to(expected_height - 1)
-        :ok
+        {:error, :missing_predecessor}
     end
   end
 

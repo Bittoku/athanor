@@ -118,14 +118,17 @@ defmodule Athanor.P2P.HeadersChain do
         %{tree: tree} = state
       )
       when not is_nil(tree) do
+    # ANY `headers` frame is the reply to an outstanding `getheaders` — it answers
+    # and **clears** this peer's solicitation token, including an empty terminator
+    # or a malformed body (note 979 B1). Otherwise an empty/stale reply would leave
+    # a reusable token that makes later unsolicited junk count as solicited. Capture
+    # whether the request was outstanding *before* clearing — only a solicited,
+    # non-empty reply may count toward the detached deep-reorg escalation (note 963).
+    solicited? = MapSet.member?(state.pending_getheaders, pid)
+    state = %{state | pending_getheaders: MapSet.delete(state.pending_getheaders, pid)}
+
     case Headers.parse(payload) do
       {:ok, headers, _rest} when headers != [] ->
-        # A `headers` frame answers (and clears) any outstanding `getheaders` we
-        # sent this peer. Only a **solicited** reply may count toward the detached
-        # deep-reorg escalation (note 963 B2) — unsolicited junk is ignored there.
-        solicited? = MapSet.member?(state.pending_getheaders, pid)
-        state = %{state | pending_getheaders: MapSet.delete(state.pending_getheaders, pid)}
-
         {tree, events} = Tree.step(state.tree, {:connect, headers})
         {:noreply, apply_events(events, pid, solicited?, %{state | tree: tree})}
 

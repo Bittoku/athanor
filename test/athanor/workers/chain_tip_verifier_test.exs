@@ -40,6 +40,36 @@ defmodule Athanor.Workers.ChainTipVerifierTest do
       assert_received {:"$gen_cast", {:process_block_hash, ^h1}}
       assert_received {:"$gen_cast", {:process_block_hash, ^h2}}
     end
+
+    test "defers a P2P extend while the local index is below the P2P seed (note 979 B3)" do
+      h1 = display_hash(0xA1)
+
+      assert :ok =
+               ChainTipVerifier.apply_tip_event({:extend, [h1]},
+                 processor: self(),
+                 verifier: self(),
+                 seed_height: fn -> 100 end,
+                 local_height: fn -> 90 end
+               )
+
+      # Index has not reached the seed → the extend must not enqueue a high block
+      # over the local→seed gap; the RPC catch-up fills the gap first.
+      refute_received {:"$gen_cast", {:process_block_hash, _}}
+    end
+
+    test "enqueues a P2P extend once the local index has reached the P2P seed" do
+      h1 = display_hash(0xA1)
+
+      assert :ok =
+               ChainTipVerifier.apply_tip_event({:extend, [h1]},
+                 processor: self(),
+                 verifier: self(),
+                 seed_height: fn -> 100 end,
+                 local_height: fn -> 100 end
+               )
+
+      assert_received {:"$gen_cast", {:process_block_hash, ^h1}}
+    end
   end
 
   describe "apply_tip_event/2 — {:reorg, …} (serialized via the processor mailbox)" do

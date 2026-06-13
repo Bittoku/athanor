@@ -207,6 +207,29 @@ defmodule Athanor.P2P.HeadersChainTest do
     assert_receive {:tip, {:reorg_too_deep, _}}
   end
 
+  test "an EMPTY headers response clears the solicitation token (note 979 B1)" do
+    setup_registry()
+    {peer, _sock} = ready_peer()
+    register(peer, 1)
+    hc = start_hc(max_detached_rounds: 2)
+
+    # Solicit a getheaders, then answer it with an EMPTY headers vector (a valid
+    # terminator). That must consume the outstanding request — it can't leave a
+    # reusable "solicited" token for later junk.
+    solicit(hc, peer)
+    send(hc, {:peer, peer, :frame, headers_frame([])})
+    _ = :sys.get_state(hc)
+
+    # Subsequent unknown-parent headers are now UNSOLICITED and must not escalate.
+    detached = chain(:binary.copy(<<0x99>>, 32), 1)
+    send(hc, {:peer, peer, :frame, headers_frame(detached)})
+    _ = :sys.get_state(hc)
+    send(hc, {:peer, peer, :frame, headers_frame(detached)})
+    _ = :sys.get_state(hc)
+
+    refute_received {:tip, {:reorg_too_deep, _}}
+  end
+
   test "UNSOLICITED unknown-parent headers from one peer do NOT escalate (note 963 B2)" do
     setup_registry()
     {peer, _sock} = ready_peer()

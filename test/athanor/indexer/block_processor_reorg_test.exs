@@ -271,7 +271,7 @@ defmodule Athanor.Indexer.BlockProcessorReorgTest do
     assert :ok = BlockProcessor.maybe_handle_reorg("h100", 101)
   end
 
-  test "maybe_handle_reorg rolls back (and is :ok) on a predecessor hash mismatch" do
+  test "maybe_handle_reorg rolls back AND refuses the child on a predecessor hash mismatch (note 979 B2)" do
     {:ok, _} =
       %BlockProcessContext{}
       |> BlockProcessContext.changeset(%{
@@ -282,8 +282,10 @@ defmodule Athanor.Indexer.BlockProcessorReorgTest do
       |> Repo.insert()
 
     # Block at 101 claims a different parent than our stored height-100 context.
-    assert :ok = BlockProcessor.maybe_handle_reorg("not-h100", 101)
-    # Rolled back below 100 → the stored context is gone.
+    # The orphaned branch is rolled back, AND the child is refused so it is not
+    # recorded over the now-missing predecessor — the canonical ancestor→tip branch
+    # must be reprocessed through the ordered path first.
+    assert {:error, :missing_predecessor} = BlockProcessor.maybe_handle_reorg("not-h100", 101)
     assert is_nil(Repo.get(BlockProcessContext, "h100"))
   end
 

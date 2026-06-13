@@ -68,6 +68,13 @@ defmodule Athanor.Workers.ChainTipVerifier do
 
   def handle_cast(:resume_p2p_authority, state), do: {:noreply, state}
 
+  # A P2P tip event from `HeadersChain`, run in this process (see `apply_tip_event/1`)
+  # so the extend gate can read the P2P root height without a self-call deadlock.
+  def handle_cast({:p2p_tip, event}, state) do
+    apply_tip_event(event, [])
+    {:noreply, state}
+  end
+
   ## ── P2P tip-event bridge (§C) ──
 
   @doc """
@@ -95,18 +102,35 @@ defmodule Athanor.Workers.ChainTipVerifier do
     - `opts` (injection seams, for tests): `:processor` (BlockProcessor name/pid,
       default `BlockProcessor`), `:verifier` (this GenServer's name/pid for the
       suspend/resume casts, default `__MODULE__`), `:resolve_height`
-      (`(orphan_hashes -> {:ok, height} | :unknown)`, default the Repo lookup).
+      (`(orphan_hashes -> {:ok, height} | :unknown)`, default the Repo lookup),
+      `:seed_height`/`:local_height` (`(-> non_neg_integer | nil)`, the extend
+      gate's P2P-root and local-index heights).
 
   ## Returns
     `:ok`.
+
+  The arity-1 form (wired as `HeadersChain`'s `:on_tip`) **casts** the event to this
+  GenServer so the work runs in the verifier's own process — it must not run inline
+  in the `HeadersChain` process, both to keep that process responsive and so the
+  extend gate can read `HeadersChain.root_height/0` without a self-call deadlock.
   """
   @spec apply_tip_event(tuple()) :: :ok
-  def apply_tip_event(event), do: apply_tip_event(event, [])
+  def apply_tip_event(event), do: GenServer.cast(__MODULE__, {:p2p_tip, event})
 
   @spec apply_tip_event(tuple(), keyword()) :: :ok
   def apply_tip_event({:extend, hashes}, opts) do
     resume_authority(opts)
-    enqueue_blocks(hashes, opts)
+
+    # Gate (note 979 B3): do not enqueue a P2P extension above the P2P seed until
+    # the local index has caught up to that seed — otherwise a high block would be
+    # recorded over the local→seed gap. The RPC catch-up fills the gap first; the
+    # extension is re-advertised and applied once contiguous.
+    if extend_allowed?(opts) do
+      enqueue_blocks(hashes, opts)
+    else
+      Logger.info("ChainTipVerifier: P2P extend deferred — local index below the P2P seed")
+      :ok
+    end
   end
 
   def apply_tip_event({:reorg, %{orphan: orphan, connect: connect}}, opts) do
@@ -205,6 +229,23 @@ defmodule Athanor.Workers.ChainTipVerifier do
   # A healthy P2P tip event means P2P recovered — clear any deep-reorg suspension.
   defp resume_authority(opts) do
     GenServer.cast(Keyword.get(opts, :verifier, __MODULE__), :resume_p2p_authority)
+  end
+
+  # Whether a P2P extend may be enqueued this round: only once the local index has
+  # reached the P2P seed/root height (so the extension is contiguous with the local
+  # chain). An unknown/unseeded P2P root (`nil`) does not block — the no-gap
+  # predecessor guard in `BlockProcessor` is the backstop.
+  defp extend_allowed?(opts) do
+    seed = resolve_height_seam(opts, :seed_height, &p2p_root_height/0)
+    local = resolve_height_seam(opts, :local_height, &local_tip_height/0)
+    is_nil(seed) or local >= seed
+  end
+
+  defp resolve_height_seam(opts, key, default_fun) do
+    case Keyword.get(opts, key, default_fun) do
+      fun when is_function(fun, 0) -> fun.()
+      value -> value
+    end
   end
 
   defp resolve_fork_height(orphan, opts) do
