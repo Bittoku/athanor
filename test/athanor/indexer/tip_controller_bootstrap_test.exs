@@ -161,4 +161,81 @@ defmodule Athanor.Indexer.TipControllerBootstrapTest do
     heights = Repo.all(BlockProcessContext) |> Enum.map(& &1.height) |> Enum.sort()
     assert heights == [103, 104, 105]
   end
+
+  # ── note-1053: capture + anchor must be atomic and self-healing ──
+
+  test "capture_bootstrap rolls back the singleton when the anchor insert fails (atomic)" do
+    proc = start_supervised!({BlockProcessor, []})
+    assert Bootstrap.fetch() == nil
+
+    # A blank id makes the in-transaction anchor changeset fail (validate_required),
+    # simulating an invalid/failed anchor insert. The boundary `Bootstrap.ensure` must
+    # roll back with it — no persisted-but-unanchored singleton can survive.
+    assert {:error, {:anchor_insert_failed, _}} = BlockProcessor.capture_bootstrap(proc, 103, "")
+
+    assert Bootstrap.fetch() == nil
+    assert Repo.aggregate(BlockProcessContext, :count) == 0
+  end
+
+  test "capture_bootstrap repairs a stranded singleton (captured, never anchored) and is idempotent" do
+    proc = start_supervised!({BlockProcessor, []})
+
+    # Simulate a prior crash: the singleton was persisted but the anchor never was.
+    Bootstrap.ensure(103, hex(103))
+    assert Repo.aggregate(BlockProcessContext, :count) == 0
+
+    # Capture detects the empty index and inserts the missing anchor (self-healing).
+    assert {:ok, 103} = BlockProcessor.capture_bootstrap(proc, 103, hex(103))
+    assert Repo.get(BlockProcessContext, hex(103)).height == 103
+
+    # Idempotent: a second call on the now-anchored index is a no-op.
+    assert {:ok, 103} = BlockProcessor.capture_bootstrap(proc, 103, hex(103))
+    assert Repo.aggregate(BlockProcessContext, :count) == 1
+  end
+
+  test "a controller restart over a stranded singleton repairs the anchor before reconciling" do
+    # The exact restart risk from note-1053: `Bootstrap.fetch/0` is non-nil (singleton
+    # persisted) but the index is empty (anchor lost to a crash). The controller must
+    # repair the anchor *before* any reconcile runs, not reconcile from height 0.
+    node = for h <- 103..105, into: %{}, do: {h, hex(h)}
+
+    proc = start_supervised!({BlockProcessor, []})
+    Bootstrap.ensure(103, hex(103))
+    assert Repo.aggregate(BlockProcessContext, :count) == 0
+
+    apply_fun = fn _p, %{rollback_to: rb, connect: connect} ->
+      start = (rb || BlockProcessor.last_processed_height()) + 1
+
+      heights =
+        if connect == [], do: [], else: Enum.to_list(start..(start + length(connect) - 1))
+
+      for h <- heights do
+        Repo.insert!(%BlockProcessContext{
+          id: node[h],
+          height: h,
+          processed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+        })
+      end
+
+      {:ok, List.last(heights) || start - 1}
+    end
+
+    pid =
+      start_supervised!({
+        TipController,
+        name: TipController,
+        rpc_height: fn -> {:ok, 105} end,
+        rpc_hash_at: fn h -> node[h] end,
+        apply_fun: apply_fun,
+        processor: proc,
+        tick_interval_ms: 60_000
+      })
+
+    _ = drain(pid)
+
+    # Anchor repaired (103 recorded from the stranded boundary), then 104 + 105 caught
+    # up contiguously — no reconcile ran from an empty/unanchored index.
+    heights = Repo.all(BlockProcessContext) |> Enum.map(& &1.height) |> Enum.sort()
+    assert heights == [103, 104, 105]
+  end
 end

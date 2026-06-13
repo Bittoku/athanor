@@ -59,16 +59,19 @@ defmodule Athanor.Indexer.BootstrapCutoverTest do
       node_hashes = %{5 => hex(5), 6 => hex(6)}
 
       # The named controller the listener will hint.
-      start_supervised!(
-        {Athanor.Indexer.TipController,
-         name: Athanor.Indexer.TipController,
-         rpc_height: fn -> {:ok, 6} end,
-         rpc_hash_at: fn h -> node_hashes[h] end,
-         local_height: fn -> 5 end,
-         local_hash_at: fn h -> if(h == 5, do: hex(5), else: nil) end,
-         apply_fun: fn _p, arg -> send(test, {:applied, arg}) && {:ok, length(arg.connect)} end,
-         tick_interval_ms: 60_000}
-      )
+      start_supervised!({
+        Athanor.Indexer.TipController,
+        # A reconcile/hint-routing test with a fixed already-synced local seam (5),
+        # not a capture test — start bootstrapped (no real BlockProcessor here).
+        name: Athanor.Indexer.TipController,
+        bootstrapped: true,
+        rpc_height: fn -> {:ok, 6} end,
+        rpc_hash_at: fn h -> node_hashes[h] end,
+        local_height: fn -> 5 end,
+        local_hash_at: fn h -> if(h == 5, do: hex(5), else: nil) end,
+        apply_fun: fn _p, arg -> send(test, {:applied, arg}) && {:ok, length(arg.connect)} end,
+        tick_interval_ms: 60_000
+      })
 
       # Drive the ZMQ listener's hashblock handler directly.
       msg = {:zmq, :sock, [<<"hashblock">>, <<0xAB>>], []}

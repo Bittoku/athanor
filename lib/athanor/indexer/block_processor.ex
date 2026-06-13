@@ -13,7 +13,7 @@ defmodule Athanor.Indexer.BlockProcessor do
   alias Athanor.Repo
   alias Athanor.Schema.{BlockProcessContext, MetaTransaction, Utxo}
   alias Athanor.Blockchain.RpcClient
-  alias Athanor.Indexer.{TransactionFilter, TransactionProcessor}
+  alias Athanor.Indexer.{Bootstrap, TransactionFilter, TransactionProcessor}
   import Ecto.Query
 
   @doc "Starts the BlockProcessor GenServer."
@@ -53,21 +53,36 @@ defmodule Athanor.Indexer.BlockProcessor do
   end
 
   @doc """
-  Records the **bootstrap anchor** — the one-time, context-only `block_process_contexts`
-  row that seeds the index at its configured boundary (Phase 7 F7.2 T7.S). Unlike a
-  normal block, the anchor's pre-bootstrap transactions are *not* indexed (the thin
-  indexer starts from here), so this is a plain insert with no RPC fetch. Idempotent.
-  Keeping it in `BlockProcessor` preserves the invariant that this module is the only
-  writer of `block_process_contexts`. Returns `{:ok, height}`.
+  Captures the **bootstrap boundary + anchor atomically** (Phase 7 F7.2 T7.S,
+  tightened per Hermes !20 note 1053). In a single DB transaction through this
+  module — the only writer of `block_process_contexts` — it:
+
+    1. ensures the capture-once `indexer_bootstrap` singleton (`Bootstrap.ensure/2`), and
+    2. **on a fresh (empty) index**, inserts the context-only anchor row that seeds the
+       index at the boundary (its pre-bootstrap transactions are *not* indexed — the
+       thin indexer starts here).
+
+  Because both writes share one transaction, a failed anchor insert rolls the
+  singleton back too: a fresh install can never be left with a persisted-but-unanchored
+  boundary that the no-gap predecessor guard would then reject forever. The op is
+  **idempotent and self-healing** — re-running it ensures the singleton and, if the
+  index is still empty (e.g. a prior crash stranded the singleton without an anchor),
+  inserts the missing anchor; on a non-empty index it is a no-op. The result is
+  **checked**: `{:error, reason}` on any failure so the caller does not treat the index
+  as bootstrapped.
 
   ## Parameters
     - `height` — the bootstrap block height.
     - `hash` — the bootstrap block's display-order hash (lowercase hex), the row id.
+
+  ## Returns
+    `{:ok, height}` once the boundary is captured and the index is anchored (or was
+    already non-empty); `{:error, reason}` if the transaction failed.
   """
-  @spec record_bootstrap_anchor(GenServer.server(), non_neg_integer(), String.t()) ::
-          {:ok, non_neg_integer()}
-  def record_bootstrap_anchor(server \\ __MODULE__, height, hash) do
-    GenServer.call(server, {:record_bootstrap_anchor, height, hash})
+  @spec capture_bootstrap(GenServer.server(), non_neg_integer(), String.t()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def capture_bootstrap(server \\ __MODULE__, height, hash) do
+    GenServer.call(server, {:capture_bootstrap, height, hash})
   end
 
   ## ── Server Callbacks ──
@@ -83,16 +98,36 @@ defmodule Athanor.Indexer.BlockProcessor do
     {:reply, state.last_height, state}
   end
 
-  def handle_call({:record_bootstrap_anchor, height, hash}, _from, state) do
-    %BlockProcessContext{}
-    |> BlockProcessContext.changeset(%{
-      id: hash,
-      height: height,
-      processed_at: DateTime.utc_now()
-    })
-    |> Repo.insert(on_conflict: :nothing)
+  def handle_call({:capture_bootstrap, height, hash}, _from, state) do
+    # Singleton + anchor in ONE transaction: a failed anchor insert rolls the
+    # boundary back too, so no persisted-but-unanchored singleton can survive
+    # (note-1053). The anchor is inserted only on a fresh (empty) index — making the
+    # op idempotent and self-healing for a previously-stranded singleton.
+    result =
+      Repo.transaction(fn ->
+        empty? = Repo.aggregate(BlockProcessContext, :count) == 0
+        Bootstrap.ensure(height, hash)
 
-    {:reply, {:ok, height}, %{state | last_height: max(state.last_height, height)}}
+        if empty? do
+          case insert_bootstrap_anchor(height, hash) do
+            {:ok, _} -> :anchored
+            {:error, reason} -> Repo.rollback({:anchor_insert_failed, reason})
+          end
+        else
+          :already_anchored
+        end
+      end)
+
+    case result do
+      {:ok, :anchored} ->
+        {:reply, {:ok, height}, %{state | last_height: max(state.last_height, height)}}
+
+      {:ok, :already_anchored} ->
+        {:reply, {:ok, height}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:apply_branch, rollback_to, connect_hashes}, _from, state) do
@@ -119,6 +154,19 @@ defmodule Athanor.Indexer.BlockProcessor do
   @impl true
   def handle_info(_msg, state) do
     {:noreply, state}
+  end
+
+  # Inserts the context-only bootstrap anchor row. `on_conflict: :nothing` keeps it
+  # idempotent; the changeset/insert result is returned so the enclosing transaction
+  # can roll back (and the caller can fail closed) on any error.
+  defp insert_bootstrap_anchor(height, hash) do
+    %BlockProcessContext{}
+    |> BlockProcessContext.changeset(%{
+      id: hash,
+      height: height,
+      processed_at: DateTime.utc_now()
+    })
+    |> Repo.insert(on_conflict: :nothing)
   end
 
   # Connects a contiguous canonical branch onto `state`, halting at the first failed

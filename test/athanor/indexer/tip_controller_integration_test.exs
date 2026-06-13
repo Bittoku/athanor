@@ -94,19 +94,22 @@ defmodule Athanor.Indexer.TipControllerIntegrationTest do
   end
 
   defp start_controller(agent) do
-    start_supervised!(
-      {TipController,
-       name: TipController,
-       rpc_height: fn -> {:ok, Agent.get(agent, & &1.node_tip)} end,
-       rpc_hash_at: fn h -> Agent.get(agent, & &1.canonical[h]) end,
-       local_height: fn -> Agent.get(agent, & &1.local) end,
-       local_hash_at: fn h -> Agent.get(agent, & &1.local_chain[h]) end,
-       apply_fun: fn _proc, %{rollback_to: rb, connect: connect} ->
-         apply_to_world(agent, rb, connect)
-       end,
-       batch: 10,
-       tick_interval_ms: 60_000}
-    )
+    start_supervised!({
+      TipController,
+      # The Agent world starts already synced (local 105), so this test exercises
+      # reconcile/apply over sockets, not bootstrap capture — start bootstrapped.
+      name: TipController,
+      bootstrapped: true,
+      rpc_height: fn -> {:ok, Agent.get(agent, & &1.node_tip)} end,
+      rpc_hash_at: fn h -> Agent.get(agent, & &1.canonical[h]) end,
+      local_height: fn -> Agent.get(agent, & &1.local) end,
+      local_hash_at: fn h -> Agent.get(agent, & &1.local_chain[h]) end,
+      apply_fun: fn _proc, %{rollback_to: rb, connect: connect} ->
+        apply_to_world(agent, rb, connect)
+      end,
+      batch: 10,
+      tick_interval_ms: 60_000
+    })
   end
 
   # Mimic BlockProcessor.apply_branch against the world: roll back the local chain to

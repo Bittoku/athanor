@@ -31,10 +31,9 @@ defmodule Athanor.Indexer.TipControllerTest do
         send(test, {:applied, arg})
         {:ok, length(arg.connect)}
       end,
-      # These reconcile-only unit tests run without a DB sandbox, so stub the
-      # bootstrap seams (the capture path is covered by tip_controller_bootstrap_test).
-      bootstrap_fetch: fn -> %{height: 0, hash: nil} end,
-      bootstrap_ensure: fn _h, _hash -> :ok end,
+      # These reconcile-only unit tests run without a DB sandbox, so start already
+      # bootstrapped (the atomic capture path is covered by tip_controller_bootstrap_test).
+      bootstrapped: true,
       processor: :ignored_processor,
       batch: 10,
       tick_interval_ms: 60_000

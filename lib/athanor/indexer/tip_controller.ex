@@ -79,16 +79,18 @@ defmodule Athanor.Indexer.TipController do
       machine: Machine.new(),
       # Whether the bootstrap boundary is captured + (on a fresh index) anchored. The
       # reconcile cycle is gated on this so a transient nil boundary hash never lets a
-      # fresh index plan a spurious catch-up from height 1 (note-1049 B1).
-      bootstrapped: false,
+      # fresh index plan a spurious catch-up from height 1 (note-1049 B1). Injectable so
+      # reconcile-only unit tests can start already-bootstrapped (DB-free).
+      bootstrapped: Keyword.get(opts, :bootstrapped, false),
       rpc_height: Keyword.get(opts, :rpc_height, &default_rpc_height/0),
       rpc_hash_at: Keyword.get(opts, :rpc_hash_at, &default_rpc_hash_at/1),
       local_height: Keyword.get(opts, :local_height, &default_local_height/0),
       local_hash_at: Keyword.get(opts, :local_hash_at, &default_local_hash_at/1),
       apply_fun: Keyword.get(opts, :apply_fun, &BlockProcessor.apply_branch/2),
-      anchor_fun: Keyword.get(opts, :anchor_fun, &BlockProcessor.record_bootstrap_anchor/3),
+      # The atomic capture+anchor op (singleton + fresh-index anchor in one txn);
+      # `(processor, height, hash) -> {:ok, height} | {:error, reason}`.
+      capture_fun: Keyword.get(opts, :capture_fun, &BlockProcessor.capture_bootstrap/3),
       bootstrap_fetch: Keyword.get(opts, :bootstrap_fetch, &Bootstrap.fetch/0),
-      bootstrap_ensure: Keyword.get(opts, :bootstrap_ensure, &Bootstrap.ensure/2),
       processor: Keyword.get(opts, :processor, BlockProcessor),
       batch: Keyword.get(opts, :batch, 10),
       tick_interval_ms: Keyword.get(opts, :tick_interval_ms, :timer.minutes(2)),
@@ -145,36 +147,40 @@ defmodule Athanor.Indexer.TipController do
 
   ## ── Private ──
 
-  # Capture the bootstrap boundary once and anchor it **atomically** (note-1045 B1,
-  # tightened per note-1049 B1): resolve the configured height/hash (or the current
-  # RPC node tip), and only persist the singleton row once the boundary **hash** is
-  # available — so a fresh index can be anchored in the same step. Because
-  # `Bootstrap.ensure/2` is capture-once/idempotent, persisting with a transient nil
-  # hash would strand the index anchorless forever; instead we defer and retry on the
-  # next tick. Marks `:bootstrapped` once the boundary exists so the reconcile cycle
-  # may run; a no-op if already captured.
+  # Capture the bootstrap boundary + anchor **atomically and retryably** (note-1045
+  # B1; tightened per note-1049 B1 and note-1053). Resolve the boundary — an
+  # already-persisted singleton wins, else the configured height/hash or the current
+  # RPC node tip — and only proceed once the boundary **hash** is known. The capture
+  # itself (`capture_fun`, default `BlockProcessor.capture_bootstrap/3`) persists the
+  # singleton and inserts the fresh-index anchor in **one transaction** through the
+  # mutation owner, so a crash/DB error/failed anchor insert can never leave a
+  # persisted-but-unanchored boundary; the op is idempotent and self-healing. Mark
+  # `:bootstrapped` (which gates the reconcile cycle) **only** on a checked `{:ok}`;
+  # any failure or an unresolved hash leaves the controller un-bootstrapped so the
+  # next tick retries — no reconcile runs meanwhile.
   defp ensure_bootstrap(%{bootstrapped: true} = state), do: state
 
   defp ensure_bootstrap(state) do
-    case state.bootstrap_fetch.() do
-      nil ->
-        case resolve_bootstrap(state) do
-          {:ok, height, hash} when is_binary(hash) ->
-            state.bootstrap_ensure.(height, hash)
-
-            if state.local_height.() == 0,
-              do: state.anchor_fun.(state.processor, height, hash)
-
-            %{state | bootstrapped: true}
-
-          # Boundary hash unavailable (RPC/hash-lookup gap) — do not persist an
-          # unanchorable singleton; retry capture on the next tick.
-          _ ->
-            state
+    case boundary(state) do
+      {:ok, height, hash} when is_binary(hash) ->
+        case state.capture_fun.(state.processor, height, hash) do
+          {:ok, _height} -> %{state | bootstrapped: true}
+          _error -> state
         end
 
-      _existing ->
-        %{state | bootstrapped: true}
+      # Boundary hash unavailable (RPC/hash-lookup gap) or capture deferred — do not
+      # mark bootstrapped; retry on the next tick.
+      _ ->
+        state
+    end
+  end
+
+  # The persisted singleton is authoritative once it exists (its stored height/hash,
+  # not a possibly-moved RPC tip); otherwise resolve a fresh boundary.
+  defp boundary(state) do
+    case state.bootstrap_fetch.() do
+      %{height: height, hash: hash} -> {:ok, height, hash}
+      nil -> resolve_bootstrap(state)
     end
   end
 
