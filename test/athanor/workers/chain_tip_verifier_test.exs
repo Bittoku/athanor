@@ -150,4 +150,79 @@ defmodule Athanor.Workers.ChainTipVerifierTest do
       refute ChainTipVerifier.should_defer_to_p2p?(false, p2p_available?: false)
     end
   end
+
+  # Hermes !18 note 937: when RPC is the active tip authority it must reconcile by
+  # HASH (not just height), and recover from the common ancestor.
+  describe "reconcile_plan/4 (RPC-authority reorg detection by hash)" do
+    test "empty local index → catch up from height 1" do
+      assert ChainTipVerifier.reconcile_plan(0, 5, fn _ -> nil end, fn _ -> "ab" end) ==
+               {:catch_up, 1, 5}
+    end
+
+    test "equal heights with a matching tip hash → synced" do
+      same = fn _ -> "aa" end
+      assert ChainTipVerifier.reconcile_plan(5, 5, same, same) == :synced
+    end
+
+    test "behind with a matching tip → forward catch-up (no rollback)" do
+      local = fn h -> %{5 => "aa"}[h] end
+      node = fn h -> %{5 => "aa", 6 => "bb", 7 => "cc"}[h] end
+      assert ChainTipVerifier.reconcile_plan(5, 7, local, node) == {:catch_up, 6, 7}
+    end
+
+    test "equal heights but DIVERGENT tip hash → reorg to the common ancestor (blocker 1)" do
+      # Agree at height 3; diverge at 4 and 5. Same height, different hashes.
+      local = fn h -> %{3 => "c", 4 => "ld4", 5 => "ld5"}[h] end
+      node = fn h -> %{3 => "c", 4 => "nd4", 5 => "nd5"}[h] end
+      assert ChainTipVerifier.reconcile_plan(5, 5, local, node) == {:reorg, 3, 5}
+    end
+
+    test "orphaned local tip with the node ahead → reorg from the common ancestor (blocker 2)" do
+      # Common ancestor 3; the connect range therefore starts at 4, so the
+      # canonical block at the old local height (5) is reprocessed, not skipped.
+      local = fn h -> %{3 => "c", 4 => "ld4", 5 => "ld5"}[h] end
+      node = fn h -> %{3 => "c", 4 => "nd4", 5 => "nd5", 6 => "nd6"}[h] end
+      assert ChainTipVerifier.reconcile_plan(5, 6, local, node) == {:reorg, 3, 6}
+    end
+  end
+
+  describe "reconcile/3 execution (RPC authority)" do
+    test "a divergence dispatches ONE apply_reorg: rollback to ancestor + canonical branch from ancestor+1" do
+      shared = "AA"
+      local = fn h -> %{3 => shared, 4 => "B4", 5 => "B5"}[h] end
+      node = fn h -> %{3 => shared, 4 => "C4", 5 => "C5"}[h] end
+
+      assert {:reorg, 3, 5} =
+               ChainTipVerifier.reconcile(5, 5,
+                 local_hash_at: local,
+                 node_hash_at: node,
+                 processor: self(),
+                 batch: 10
+               )
+
+      c4 = Base.decode16!("C4")
+      c5 = Base.decode16!("C5")
+      assert_received {:"$gen_cast", {:apply_reorg, 3, [^c4, ^c5]}}
+      refute_received {:"$gen_cast", {:process_block_hash, _}}
+    end
+
+    test "behind dispatches forward catch-up casts only (no rollback)" do
+      local = fn h -> %{5 => "AA"}[h] end
+      node = fn h -> %{5 => "AA", 6 => "B6", 7 => "B7"}[h] end
+
+      assert {:catch_up, 6, 7} =
+               ChainTipVerifier.reconcile(5, 7,
+                 local_hash_at: local,
+                 node_hash_at: node,
+                 processor: self(),
+                 batch: 10
+               )
+
+      b6 = Base.decode16!("B6")
+      b7 = Base.decode16!("B7")
+      assert_received {:"$gen_cast", {:process_block_hash, ^b6}}
+      assert_received {:"$gen_cast", {:process_block_hash, ^b7}}
+      refute_received {:"$gen_cast", {:apply_reorg, _, _}}
+    end
+  end
 end

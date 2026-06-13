@@ -218,49 +218,19 @@ defmodule Athanor.Workers.ChainTipVerifier do
   end
 
   defp verify_chain_tip(state) do
-    with {:ok, node_height} <- RpcClient.get_block_count(),
-         {:ok, _node_hash} <- RpcClient.get_block_hash(node_height) do
-      local_tip =
-        BlockProcessContext
-        |> order_by([b], desc: b.height)
-        |> limit(1)
-        |> Repo.one()
+    with {:ok, node_height} <- RpcClient.get_block_count() do
+      local_height = local_tip_height()
 
-      local_height = if local_tip, do: local_tip.height, else: 0
-
-      cond do
-        local_height == node_height ->
-          # In sync
-          %{state | consecutive_synced: state.consecutive_synced + 1}
-
-        local_height < node_height ->
-          # Behind. When the P2P HeadersChain is the active tip authority (and not
-          # suspended by a deep reorg) it is already driving catch-up via
-          # `apply_tip_event/1`, so the RPC poll only logs (passive consistency
-          # check) and does not double-drive. When P2P is not active (disabled /
-          # zero peers) or suspended, the RPC poll catches up — cold-start parity
-          # and the deep-reorg fallback.
-          if should_defer_to_p2p?(state.p2p_authority_suspended) do
-            Logger.debug(
-              "ChainTipVerifier: #{node_height - local_height} behind; P2P is active tip authority, deferring catch-up"
-            )
-          else
-            Logger.info(
-              "ChainTipVerifier: #{node_height - local_height} blocks behind, catching up"
-            )
-
-            catch_up(local_height + 1, node_height)
-          end
-
-          %{state | consecutive_synced: 0}
-
-        local_height > node_height ->
-          # Ahead of node? Possible reorg
-          Logger.warning(
-            "ChainTipVerifier: local height #{local_height} > node #{node_height}, possible reorg"
-          )
-
-          %{state | consecutive_synced: 0}
+      if should_defer_to_p2p?(state.p2p_authority_suspended) do
+        # P2P is the active tip authority and already driving catch-up via
+        # `apply_tip_event/1`; the RPC poll stays a passive consistency check.
+        Logger.debug("ChainTipVerifier: P2P is the active tip authority; RPC poll passive")
+        %{state | consecutive_synced: 0}
+      else
+        # RPC is the authority (P2P disabled / zero peers / deep-reorg suspended).
+        # Reconcile by HASH from the common ancestor — same-height divergence and
+        # orphaned tips must be detected and recovered, not read as synced.
+        rpc_reconcile(local_height, node_height, state)
       end
     else
       {:error, reason} ->
@@ -269,26 +239,157 @@ defmodule Athanor.Workers.ChainTipVerifier do
     end
   end
 
-  defp catch_up(from_height, to_height) when from_height > to_height, do: :ok
+  # Run a reconciliation cycle with RPC as the authority, then fold the outcome
+  # into the synced counter. Bails out (no change) if the node hash at the local
+  # tip can't be read this cycle, so a transient RPC hiccup never triggers a
+  # spurious deep rollback — it retries on the next tick.
+  defp rpc_reconcile(0, node_height, state) do
+    apply_reconcile_result(reconcile(0, node_height, default_reconcile_opts()), state)
+  end
 
-  defp catch_up(from_height, to_height) do
-    # Process up to 10 blocks per cycle to avoid blocking
-    max_height = min(from_height + 9, to_height)
+  defp rpc_reconcile(local_height, node_height, state) do
+    case rpc_hash_at(min(local_height, node_height)) do
+      nil ->
+        Logger.warning("ChainTipVerifier: node hash unavailable this cycle; deferring reconcile")
+        state
 
-    Enum.each(from_height..max_height, fn height ->
-      case RpcClient.get_block_hash(height) do
-        {:ok, hash_hex} ->
-          case Base.decode16(hash_hex, case: :mixed) do
-            {:ok, hash_binary} ->
-              GenServer.cast(BlockProcessor, {:process_block_hash, hash_binary})
+      _hash ->
+        apply_reconcile_result(
+          reconcile(local_height, node_height, default_reconcile_opts()),
+          state
+        )
+    end
+  end
 
-            :error ->
-              Logger.warning("ChainTipVerifier: invalid block hash at height #{height}")
-          end
+  defp apply_reconcile_result(:synced, state),
+    do: %{state | consecutive_synced: state.consecutive_synced + 1}
 
-        {:error, reason} ->
-          Logger.warning("ChainTipVerifier: failed to get hash for #{height}: #{inspect(reason)}")
-      end
-    end)
+  defp apply_reconcile_result(_acted, state), do: %{state | consecutive_synced: 0}
+
+  @doc """
+  Plans RPC-authority reconciliation by **hash** (Hermes !18 note 937). Walks down
+  from `min(local_height, node_height)` to the highest height where the local and
+  node hashes agree (the common ancestor), then:
+
+    * `:synced` — heights equal and tips agree;
+    * `{:catch_up, from, to}` — no divergence, the node is simply ahead;
+    * `{:reorg, ancestor, to}` — the chains diverge: roll back to `ancestor` and
+      reprocess the canonical branch from `ancestor + 1` (so the canonical block at
+      the old local height is never skipped), up to `to`.
+
+  `local_hash_at`/`node_hash_at` are `(height -> hash | nil)`. Pure.
+  """
+  @spec reconcile_plan(non_neg_integer(), non_neg_integer(), fun(), fun()) ::
+          :synced
+          | {:catch_up, pos_integer(), non_neg_integer()}
+          | {:reorg, non_neg_integer(), non_neg_integer()}
+  def reconcile_plan(0, node_height, _local_hash_at, _node_hash_at),
+    do: {:catch_up, 1, node_height}
+
+  def reconcile_plan(local_height, node_height, local_hash_at, node_hash_at) do
+    ancestor = common_ancestor(min(local_height, node_height), local_hash_at, node_hash_at)
+
+    cond do
+      ancestor == local_height and local_height == node_height -> :synced
+      ancestor == local_height -> {:catch_up, local_height + 1, node_height}
+      true -> {:reorg, ancestor, node_height}
+    end
+  end
+
+  # Highest height (≤ `h`) at which the local and node hashes agree; 0 (genesis) if
+  # they never do within the window walked.
+  defp common_ancestor(0, _local_hash_at, _node_hash_at), do: 0
+
+  defp common_ancestor(h, local_hash_at, node_hash_at) do
+    lh = local_hash_at.(h)
+
+    if not is_nil(lh) and lh == node_hash_at.(h),
+      do: h,
+      else: common_ancestor(h - 1, local_hash_at, node_hash_at)
+  end
+
+  @doc """
+  Executes a `reconcile_plan/4` against the node, dispatching the recovery to
+  `BlockProcessor`. A `{:reorg, …}` is a single ordered `apply_reorg/3` op
+  (rollback + canonical branch from `ancestor + 1`); a `{:catch_up, …}` enqueues a
+  bounded forward batch. Returns the plan that was executed. `opts`:
+  `:local_hash_at`, `:node_hash_at` (`(height -> hash | nil)`), `:processor`,
+  `:batch` (max blocks dispatched per cycle, default 10).
+  """
+  @spec reconcile(non_neg_integer(), non_neg_integer(), keyword()) :: term()
+  def reconcile(local_height, node_height, opts) do
+    local_hash_at = Keyword.fetch!(opts, :local_hash_at)
+    node_hash_at = Keyword.fetch!(opts, :node_hash_at)
+    processor = Keyword.get(opts, :processor, BlockProcessor)
+    batch = Keyword.get(opts, :batch, 10)
+
+    case reconcile_plan(local_height, node_height, local_hash_at, node_hash_at) do
+      :synced ->
+        :synced
+
+      {:catch_up, from, to} = plan ->
+        Enum.each(branch_hashes(from, to, node_hash_at, batch), fn hash ->
+          GenServer.cast(processor, {:process_block_hash, hash})
+        end)
+
+        plan
+
+      {:reorg, ancestor, to} = plan ->
+        connect = branch_hashes(ancestor + 1, to, node_hash_at, batch)
+        BlockProcessor.apply_reorg(processor, ancestor, connect)
+        plan
+    end
+  end
+
+  # Decoded node block-hash binaries for `from..to`, capped to `batch` blocks per
+  # cycle (the remainder is picked up by later ticks). Malformed/missing hashes are
+  # skipped (logged), so a single bad height can't abort the batch.
+  defp branch_hashes(from, to, _node_hash_at, _batch) when from > to, do: []
+
+  defp branch_hashes(from, to, node_hash_at, batch) do
+    last = min(from + batch - 1, to)
+
+    for height <- from..last, hash = decode_hash(node_hash_at.(height)), hash != nil, do: hash
+  end
+
+  defp decode_hash(nil), do: nil
+
+  defp decode_hash(hex) do
+    case Base.decode16(hex, case: :mixed) do
+      {:ok, binary} -> binary
+      :error -> nil
+    end
+  end
+
+  # Production reconcile seams: local hashes from `block_process_contexts`, node
+  # hashes from RPC. Hashes are compared as lowercase hex so the two sources line
+  # up (the context id is `encode16(:lower)`; RPC hex case may differ).
+  defp default_reconcile_opts do
+    [
+      local_hash_at: &local_hash_at/1,
+      node_hash_at: &rpc_hash_at/1,
+      processor: BlockProcessor
+    ]
+  end
+
+  defp local_tip_height do
+    case BlockProcessContext |> order_by([b], desc: b.height) |> limit(1) |> Repo.one() do
+      %BlockProcessContext{height: height} -> height
+      nil -> 0
+    end
+  end
+
+  defp local_hash_at(height) do
+    case Repo.get_by(BlockProcessContext, height: height) do
+      %BlockProcessContext{id: id} -> String.downcase(id)
+      nil -> nil
+    end
+  end
+
+  defp rpc_hash_at(height) do
+    case RpcClient.get_block_hash(height) do
+      {:ok, hex} -> String.downcase(hex)
+      {:error, _reason} -> nil
+    end
   end
 end
