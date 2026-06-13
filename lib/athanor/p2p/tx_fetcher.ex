@@ -95,9 +95,12 @@ defmodule Athanor.P2P.TxFetcher do
 
   @impl true
   def handle_call({:fetch, txid}, from, state) do
-    case PeerRegistry.pids(state.registry) do
+    case safe_pids(state.registry) do
       [] ->
-        # Cold-start gate: no peers → instant miss, before any getdata.
+        # Cold-start gate: no peers → instant miss, before any getdata. A registry
+        # that is absent/restarting makes `pids/1` exit; `safe_pids/1` normalizes
+        # that to `[]` so the fetch fails closed (`:miss`) here instead of crashing
+        # the fetcher (which would drop any in-flight waiters for other txids).
         {:reply, :miss, state}
 
       pids ->
@@ -176,6 +179,17 @@ defmodule Athanor.P2P.TxFetcher do
   # Default production selector: up to `fanout` randomly-shuffled live peers (so a
   # pull-fetch doesn't always hammer the same peer / leak a stable pattern).
   defp default_selector(pids, fanout), do: pids |> Enum.shuffle() |> Enum.take(fanout)
+
+  # `PeerRegistry.pids/1` is a `GenServer.call` — a registry that is absent or
+  # restarting makes it exit. Treat that as "no peers" so a fetch fails closed to
+  # `:miss` rather than crashing the fetcher (and dropping other waiters).
+  defp safe_pids(registry) do
+    PeerRegistry.pids(registry)
+  rescue
+    _ -> []
+  catch
+    :exit, _ -> []
+  end
 
   defp now(state), do: state.now_fun.()
   defp schedule_tick(interval_ms), do: Process.send_after(self(), :tick, interval_ms)

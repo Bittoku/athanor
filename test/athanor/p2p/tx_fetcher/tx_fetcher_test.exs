@@ -144,6 +144,20 @@ defmodule Athanor.P2P.TxFetcherTest do
     assert TxFetcher.fetch(fetcher, txid, call_timeout: 5_000) == :miss
   end
 
+  test "an unavailable registry makes fetch fail closed to :miss without crashing the fetcher" do
+    # The fetcher's registry name has no live process → PeerRegistry.pids/1 exits
+    # inside handle_call; safe_pids/1 normalizes it to [] → :miss. The fetcher
+    # stays alive, so any in-flight waiters for other txids are preserved.
+    {fetcher, _} = start_fetcher(registry: :tx_fetcher_absent_registry)
+    ref = Process.monitor(fetcher)
+    {txid, _raw} = p2pkh_tx(0x4B)
+
+    # A synchronous :miss (rather than the call exiting) plus no monitor DOWN
+    # proves the fetcher handled the registry failure without crashing.
+    assert TxFetcher.fetch(fetcher, txid) == :miss
+    refute_received {:DOWN, ^ref, :process, ^fetcher, _}
+  end
+
   test "fetch getdatas the selector-chosen peers and resolves {:ok, raw} on a matching tx" do
     setup_registry()
     {p, sock} = ready_peer()
