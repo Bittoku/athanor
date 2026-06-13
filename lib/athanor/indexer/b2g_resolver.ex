@@ -24,13 +24,27 @@ defmodule Athanor.Indexer.B2gResolver do
   @doc """
   Resolves the provenance chain for a given STAS UTXO.
 
+  ## Txid byte order (the one boundary)
+  `txid` is **wire / internal order** — the same convention as
+  `BSV.Transaction.txid_binary/1` and `input.source_txid`, which is what
+  `MetaTransaction.txid` is keyed on and what the chain walk produces from each
+  input. The P2P provider therefore decodes it **directly** to the wire txid the
+  `inv`/`getdata` protocol uses (no reversal) — conversion to display order, if
+  ever needed, happens only for human-facing output, not here. (The REST/RPC
+  provider seams are passed this same wire-order hex unchanged; their
+  display-order expectation is a pre-existing, separate concern this module does
+  not alter.)
+
   ## Parameters
-    - `txid` — transaction ID (binary or hex string)
+    - `txid` — transaction ID (binary **or wire-order hex string**)
     - `vout` — output index
+    - `opts` — `:providers` (a `%{provider => (txid_hex -> {:ok, tx} | :miss |
+      {:error, _})}` map; default `default_providers/0`) and `:p2p_available?`
+      (forwarded to `SourceRouter.route/3`); both are test seams.
 
   ## Returns
-    `{:ok, chain}` where chain is a list of `{txid_hex, vout}` from tip to genesis,
-    or `{:error, reason}`
+    `{:ok, chain}` where chain is a list of `{txid_hex, vout}` (wire-order hex)
+    from tip to genesis, or `{:error, reason}`.
   """
   def resolve(txid, vout, opts \\ []) do
     txid_hex = normalize_txid(txid)

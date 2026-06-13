@@ -140,6 +140,26 @@ defmodule Athanor.P2P.TxFetcher.IntegrationTest do
              B2gResolver.resolve(txid, 0, providers: providers, p2p_available?: true)
   end
 
+  test "the PRODUCTION b2g provider (default_providers, no stand-in) issues a wire-order getdata and resolves via P2P" do
+    # This exercises the real `default_providers/0` -> `p2p_fetch/1` -> `TxFetcher`
+    # path (no injected `:providers`), proving the wire/display boundary: a
+    # wire-order txid is sent verbatim as the `getdata` hash, and REST is skipped
+    # on the P2P hit (route stops at `:p2p`).
+    parent = p2pkh_tx(0x74)
+    wire_txid = BSV.Transaction.txid_binary(parent)
+    start_p2p(parent)
+
+    # No `:providers` -> default providers (the real p2p_fetch + real REST clients,
+    # which are never reached because P2P hits).
+    assert {:ok, [{hex, 0}]} = B2gResolver.resolve(wire_txid, 0, p2p_available?: true)
+    assert hex == Base.encode16(wire_txid, case: :lower)
+
+    # The peer was asked for exactly the wire-order hash (no reversal at the P2P
+    # boundary) — the hash-order trap the phase plan called out.
+    assert_received {:server_received, :getdata, hashes}
+    assert wire_txid in hashes
+  end
+
   test "a parent the peer lacks gets notfound → fetcher misses → REST fallback resolves it" do
     served = p2pkh_tx(0x72)
     absent = p2pkh_tx(0x73)

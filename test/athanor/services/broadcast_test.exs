@@ -282,6 +282,36 @@ defmodule Athanor.Services.BroadcastTest do
     assert record.status == "accepted"
   end
 
+  test "relay that EXITS (TxRelay down/restarting) falls back to RPC, not a crash" do
+    tx = build_tx()
+
+    assert {:ok, record} =
+             Broadcast.broadcast_tx(tx.hex,
+               peers_available?: true,
+               # Simulates TxRelay.broadcast exiting (process absent / its own
+               # PeerRegistry recheck exiting).
+               relay: fn _, _ -> exit(:noproc) end,
+               broadcaster: recording_broadcaster({:ok, tx.txid_hex})
+             )
+
+    assert_received {:broadcaster, _hex}
+    assert record.status == "accepted"
+  end
+
+  test "relay that RAISES falls back to RPC" do
+    tx = build_tx()
+
+    assert {:ok, record} =
+             Broadcast.broadcast_tx(tx.hex,
+               peers_available?: true,
+               relay: fn _, _ -> raise "relay boom" end,
+               broadcaster: recording_broadcaster({:ok, tx.txid_hex})
+             )
+
+    assert_received {:broadcaster, _hex}
+    assert record.status == "accepted"
+  end
+
   test "registry unavailable while P2P enabled: broadcast fails closed to the RPC path" do
     # P2P enabled, but no PeerRegistry process → PeerRegistry.pids/0 exits. The
     # peer gate must fail closed to RPC rather than crash before the fallback.

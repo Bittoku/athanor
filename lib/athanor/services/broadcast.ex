@@ -132,7 +132,7 @@ defmodule Athanor.Services.Broadcast do
   end
 
   defp relay_route(broadcast, raw_tx_hex, txid_bin, raw_bin, opts) do
-    case relay_fun(opts).(txid_bin, raw_bin) do
+    case safe_relay(relay_fun(opts), txid_bin, raw_bin) do
       :ok ->
         broadcast = advance(broadcast, "relayed")
 
@@ -140,12 +140,27 @@ defmodule Athanor.Services.Broadcast do
           do: rpc_broadcast(broadcast, raw_tx_hex, opts),
           else: {:ok, broadcast}
 
-      {:error, reason} when reason in [:saturated, :no_peers] ->
-        # P2P can't carry it (capacity, or peers raced to zero) — degrade to the
+      {:error, reason} ->
+        # The relay couldn't carry it — capacity (`:saturated`), peers raced to
+        # zero (`:no_peers`), or the relay process itself was absent/crashed
+        # (`{:relay_crashed | :relay_exited, _}`). In every case degrade to the
         # RPC path exactly like cold start so the tx still broadcasts.
         Logger.debug("TxRelay enqueue #{inspect(reason)}; falling back to RPC broadcast")
         rpc_broadcast(broadcast, raw_tx_hex, opts)
     end
+  end
+
+  # The relay seam is a `GenServer.call` (to `TxRelay`), which **exits** the
+  # caller if the relay is absent/restarting/timed out, or if the relay's own
+  # `PeerRegistry` recheck exits. Normalize any such failure to `{:error, _}` so
+  # `relay_route/5` still reaches the RPC fallback rather than crashing
+  # `broadcast_tx/2`.
+  defp safe_relay(relay_fun, txid_bin, raw_bin) do
+    relay_fun.(txid_bin, raw_bin)
+  rescue
+    error -> {:error, {:relay_crashed, error}}
+  catch
+    :exit, reason -> {:error, {:relay_exited, reason}}
   end
 
   defp rpc_broadcast(broadcast, raw_tx_hex, opts) do

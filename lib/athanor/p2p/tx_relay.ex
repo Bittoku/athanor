@@ -122,8 +122,10 @@ defmodule Athanor.P2P.TxRelay do
   def handle_call({:broadcast, txid, raw_bin}, _from, state) do
     # Recheck the live-peer set here (peer-churn race): zero peers means P2P
     # can't carry the tx, so signal :no_peers BEFORE computing `held` — that
-    # keeps `held = min(2, N−1)` out of the N == 0 case entirely.
-    case PeerRegistry.pids(state.registry) do
+    # keeps `held = min(2, N−1)` out of the N == 0 case entirely. The recheck is
+    # itself fail-safe: a registry that is absent/restarting makes `pids/1` exit,
+    # which we normalize to "no peers" so the broadcaster (RPC) fallback runs.
+    case safe_pids(state.registry) do
       [] ->
         {:reply, {:error, :no_peers}, state}
 
@@ -229,6 +231,17 @@ defmodule Athanor.P2P.TxRelay do
   end
 
   defp default_audit(event), do: Logger.debug("TxRelay audit: #{inspect(event)}")
+
+  # `PeerRegistry.pids/1` is a `GenServer.call` — a registry that is absent or
+  # restarting makes it exit. Treat that as "no peers" so the broadcast degrades
+  # to the RPC fallback rather than crashing the relay (and its caller).
+  defp safe_pids(registry) do
+    PeerRegistry.pids(registry)
+  rescue
+    _ -> []
+  catch
+    :exit, _ -> []
+  end
 
   defp now(state), do: state.now_fun.()
 

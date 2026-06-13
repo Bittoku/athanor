@@ -192,6 +192,10 @@ defmodule Athanor.P2P.FakePeerServer do
         _ -> []
       end
 
+    # Report the requested hashes (wire order, as on the wire) so a test can
+    # assert the client issued the getdata for the expected txid (T5.5 boundary).
+    send(script.report_to, {:server_received, :getdata, requested})
+
     cond do
       is_nil(script.serve_txid) or script.serve_txid in requested ->
         send_frame(sock, script.network, :tx, payload)
