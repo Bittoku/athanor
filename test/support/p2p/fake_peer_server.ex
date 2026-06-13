@@ -64,8 +64,7 @@ defmodule Athanor.P2P.FakePeerServer do
     # nil (default), `getdata` is ignored, leaving every prior test unchanged.
     tx_payload = Keyword.get(opts, :tx_payload)
 
-    {:ok, listen} =
-      :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, packet: :raw])
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, packet: :raw])
 
     {:ok, port} = :inet.port(listen)
 
@@ -80,7 +79,9 @@ defmodule Athanor.P2P.FakePeerServer do
       # Phase 4 round-trip seams (default to the pre-Phase-4 behavior).
       announce_on_verack: Keyword.get(opts, :announce_on_verack, true),
       serve_on_inv: Keyword.get(opts, :serve_on_inv, false),
-      relay_back_hash: Keyword.get(opts, :relay_back_hash)
+      relay_back_hash: Keyword.get(opts, :relay_back_hash),
+      # Phase 5 pull-fetch: serve `tx_payload` only for this txid, else notfound.
+      serve_txid: Keyword.get(opts, :serve_txid)
     }
 
     pid = spawn_link(fn -> accept(listen, script) end)
@@ -172,11 +173,45 @@ defmodule Athanor.P2P.FakePeerServer do
     progress
   end
 
-  # Answer a `getdata` with the configured raw tx (T3.4/T4.3). The peer requests
-  # the tx it was inv'd; we serve the bytes whose hash the client will verify.
-  defp react(%Frame{command: "getdata"}, sock, progress, %{tx_payload: payload} = script)
+  # Answer a `getdata` with the configured raw tx (T3.4/T4.3/T5.5). The peer
+  # requests the tx it was inv'd (or pull-fetched); we serve the bytes whose hash
+  # the client will verify. When `:serve_txid` is set (T5.5 pull-fetch), only that
+  # txid is served — any other requested txid gets a `notfound` (so the fetcher
+  # falls back to REST). With `:serve_txid` nil (default) we serve for any getdata,
+  # leaving every prior test unchanged.
+  defp react(
+         %Frame{command: "getdata", payload: body},
+         sock,
+         progress,
+         %{tx_payload: payload} = script
+       )
        when is_binary(payload) do
-    send_frame(sock, script.network, :tx, payload)
+    requested =
+      case Inv.parse(body, max_items: @max_inv_items) do
+        {:ok, items, _rest} -> for {:tx, hash} <- items, do: hash
+        _ -> []
+      end
+
+    # Report the requested hashes (wire order, as on the wire) so a test can
+    # assert the client issued the getdata for the expected txid (T5.5 boundary).
+    send(script.report_to, {:server_received, :getdata, requested})
+
+    cond do
+      is_nil(script.serve_txid) or script.serve_txid in requested ->
+        send_frame(sock, script.network, :tx, payload)
+
+      requested != [] ->
+        send_frame(
+          sock,
+          script.network,
+          :notfound,
+          Inv.serialize(Enum.map(requested, &{:tx, &1}))
+        )
+
+      true ->
+        :ok
+    end
+
     progress
   end
 

@@ -41,7 +41,7 @@ defmodule Athanor.Services.Broadcast do
   """
 
   alias Athanor.Blockchain.RpcClient
-  alias Athanor.P2P.{PeerRegistry, Supervisor, TxRelay}
+  alias Athanor.P2P.{PeerRegistry, SourceRouter, Supervisor, TxRelay}
   alias Athanor.Repo
   alias Athanor.Schema.Broadcast
 
@@ -122,16 +122,17 @@ defmodule Athanor.Services.Broadcast do
       |> Broadcast.changeset(%{txid: txid_hex, hex: raw_tx_hex, status: "pending"})
       |> Repo.insert()
 
-    if peers_available?(opts) do
+    if p2p_broadcast?(opts) do
       relay_route(broadcast, raw_tx_hex, txid_bin, raw_bin, opts)
     else
-      # Cold start: P2P disabled or no live peers — exactly today's RPC-only path.
+      # Cold start (P2P disabled / no live peers), or the router has routed
+      # `:broadcast` away from `:p2p` — exactly today's RPC-only path.
       rpc_broadcast(broadcast, raw_tx_hex, opts)
     end
   end
 
   defp relay_route(broadcast, raw_tx_hex, txid_bin, raw_bin, opts) do
-    case relay_fun(opts).(txid_bin, raw_bin) do
+    case safe_relay(relay_fun(opts), txid_bin, raw_bin) do
       :ok ->
         broadcast = advance(broadcast, "relayed")
 
@@ -139,12 +140,27 @@ defmodule Athanor.Services.Broadcast do
           do: rpc_broadcast(broadcast, raw_tx_hex, opts),
           else: {:ok, broadcast}
 
-      {:error, reason} when reason in [:saturated, :no_peers] ->
-        # P2P can't carry it (capacity, or peers raced to zero) — degrade to the
+      {:error, reason} ->
+        # The relay couldn't carry it — capacity (`:saturated`), peers raced to
+        # zero (`:no_peers`), or the relay process itself was absent/crashed
+        # (`{:relay_crashed | :relay_exited, _}`). In every case degrade to the
         # RPC path exactly like cold start so the tx still broadcasts.
         Logger.debug("TxRelay enqueue #{inspect(reason)}; falling back to RPC broadcast")
         rpc_broadcast(broadcast, raw_tx_hex, opts)
     end
+  end
+
+  # The relay seam is a `GenServer.call` (to `TxRelay`), which **exits** the
+  # caller if the relay is absent/restarting/timed out, or if the relay's own
+  # `PeerRegistry` recheck exits. Normalize any such failure to `{:error, _}` so
+  # `relay_route/5` still reaches the RPC fallback rather than crashing
+  # `broadcast_tx/2`.
+  defp safe_relay(relay_fun, txid_bin, raw_bin) do
+    relay_fun.(txid_bin, raw_bin)
+  rescue
+    error -> {:error, {:relay_crashed, error}}
+  catch
+    :exit, reason -> {:error, {:relay_exited, reason}}
   end
 
   defp rpc_broadcast(broadcast, raw_tx_hex, opts) do
@@ -215,8 +231,27 @@ defmodule Athanor.Services.Broadcast do
 
   defp peers_available?(opts) do
     Keyword.get_lazy(opts, :peers_available?, fn ->
-      Supervisor.enabled?() and PeerRegistry.pids() != []
+      Supervisor.enabled?() and registry_has_peers?()
     end)
+  end
+
+  # `PeerRegistry.pids/0` is a `GenServer.call` that **exits** if the registry is
+  # temporarily absent (supervisor restart / cold start). Fail **closed** to the
+  # RPC path rather than crash before `rpc_broadcast/3` is reached.
+  defp registry_has_peers? do
+    PeerRegistry.pids() != []
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
+  # The P2P relay path is taken only when the capability router routes
+  # `:broadcast` to `:p2p` (the default) **and** live peers exist. Routing
+  # `:broadcast` to a non-P2P provider via config forces the RPC-only path even
+  # with peers — so P2P-vs-RPC is one routing decision (§C), config not hardcode.
+  defp p2p_broadcast?(opts) do
+    match?({:p2p, _fallbacks}, SourceRouter.resolve(:broadcast)) and peers_available?(opts)
   end
 
   defp p2p_env, do: Application.get_env(:athanor, Athanor.P2P, [])
