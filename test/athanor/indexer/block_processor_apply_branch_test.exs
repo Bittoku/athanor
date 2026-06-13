@@ -84,13 +84,16 @@ defmodule Athanor.Indexer.BlockProcessorApplyBranchTest do
       assert :ok = BlockProcessor.predecessor_status("h100", 101, bootstrap: nil)
     end
 
-    test "rolls back AND refuses the child on a predecessor mismatch" do
+    test "refuses the child on a predecessor mismatch WITHOUT mutating (note-1061 B2)" do
       Repo.insert!(%BlockProcessContext{id: "h100", height: 100, processed_at: now()})
 
       assert {:error, :missing_predecessor} =
                BlockProcessor.predecessor_status("x", 101, bootstrap: nil)
 
-      assert is_nil(Repo.get(BlockProcessContext, "h100"))
+      # The guard is read-only: it must NOT roll back here. `{:error, _}` means nothing
+      # was mutated; the divergent predecessor is corrected by the reconcile-supplied
+      # `rollback_to` in a subsequent `apply_branch/2`, the single rollback authority.
+      refute is_nil(Repo.get(BlockProcessContext, "h100"))
     end
 
     test "accepts a missing-predecessor block ONLY when it is the configured bootstrap block" do
@@ -152,6 +155,56 @@ defmodule Athanor.Indexer.BlockProcessorApplyBranchTest do
                })
 
       assert BlockProcessor.last_processed_height() == 100
+    end
+
+    test "waits for a slow ordered mutation and returns its synchronous result (note-1061 B1)" do
+      # An injected processor that blocks until released, simulating a slow RPC/DB/batch
+      # path. The call must wait for the in-flight ordered mutation and return its real
+      # result — never let a call timeout fold a false failure while the server keeps
+      # mutating. `apply_branch/2` uses `:infinity` (bounded batches), so a slow op is
+      # carried to completion synchronously.
+      test = self()
+
+      blocker = fn _hash, state ->
+        send(test, :in_mutation)
+
+        receive do
+          :proceed -> :ok
+        end
+
+        {:ok, state.last_height + 1}
+      end
+
+      proc = start_supervised!({BlockProcessor, process_fun: blocker})
+
+      task =
+        Task.async(fn ->
+          BlockProcessor.apply_branch(proc, %{rollback_to: nil, connect: [<<1, 0::248>>]})
+        end)
+
+      # The mutation is in flight inside the server, blocked until released.
+      assert_receive :in_mutation, 1_000
+      # The call has not returned/exited — it is waiting on the mutation, not folding.
+      refute Task.yield(task, 50)
+
+      send(proc, :proceed)
+      assert {:ok, 1} = Task.await(task, 1_000)
+      assert BlockProcessor.last_processed_height() == 1
+    end
+
+    test "a first-block predecessor refusal returns {:error}, last_height unchanged, no rollback (note-1061 B2)" do
+      # Seed a durable tip at 100, then refuse the first connect block (as the read-only
+      # predecessor guard does on a mismatch). The contract must hold: {:error} (nothing
+      # mutated), last_height stays at the durable tip, and the existing context is kept.
+      Repo.insert!(%BlockProcessContext{id: "h100", height: 100, processed_at: now()})
+      refuse = fn _hash, _state -> {:error, :missing_predecessor} end
+      proc = start_supervised!({BlockProcessor, process_fun: refuse})
+
+      assert {:error, :missing_predecessor} =
+               BlockProcessor.apply_branch(proc, %{rollback_to: nil, connect: [<<9, 0::248>>]})
+
+      assert BlockProcessor.last_processed_height() == 100
+      refute is_nil(Repo.get(BlockProcessContext, "h100"))
     end
   end
 

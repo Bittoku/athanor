@@ -49,7 +49,11 @@ defmodule Athanor.Indexer.BlockProcessor do
           | {:partial, non_neg_integer(), term()}
           | {:error, term()}
   def apply_branch(server \\ __MODULE__, %{rollback_to: rollback_to, connect: connect}) do
-    GenServer.call(server, {:apply_branch, rollback_to, connect})
+    # `:infinity` (note-1061 B1): the ordered mutation may fetch blocks over RPC and do
+    # per-block DB work; a bounded batch can legitimately exceed the default 5s call
+    # timeout. A timeout would let the controller fold a false failure while this server
+    # keeps mutating — so the caller waits for the authoritative synchronous result.
+    GenServer.call(server, {:apply_branch, rollback_to, connect}, :infinity)
   end
 
   @doc """
@@ -82,15 +86,21 @@ defmodule Athanor.Indexer.BlockProcessor do
   @spec capture_bootstrap(GenServer.server(), non_neg_integer(), String.t()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def capture_bootstrap(server \\ __MODULE__, height, hash) do
-    GenServer.call(server, {:capture_bootstrap, height, hash})
+    # `:infinity` (note-1061 B1): the capture+anchor transaction runs through this
+    # server and must not be abandoned by a default 5s call timeout while it commits.
+    GenServer.call(server, {:capture_bootstrap, height, hash}, :infinity)
   end
 
   ## ── Server Callbacks ──
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     last_height = get_last_processed_height()
-    {:ok, %{last_height: last_height, processing: false}}
+    # `:process_fun` ((hash, state) -> {:ok, height} | {:error, reason}) is the
+    # per-block connect step; injectable so unit tests can drive a slow/refusing
+    # processor without RPC. Defaults to the real block processor.
+    process_fun = Keyword.get(opts, :process_fun, &process_connect/2)
+    {:ok, %{last_height: last_height, processing: false, process_fun: process_fun}}
   end
 
   @impl true
@@ -140,7 +150,9 @@ defmodule Athanor.Indexer.BlockProcessor do
         {false, state}
       end
 
-    {result, state} = connect_branch(connect_hashes, state, mutated?: mutated?)
+    {result, state} =
+      connect_branch(connect_hashes, state, mutated?: mutated?, process_fun: state.process_fun)
+
     {:reply, result, state}
   end
 
@@ -363,12 +375,14 @@ defmodule Athanor.Indexer.BlockProcessor do
     end)
   end
 
-  # Reorg detection + no-gap bootstrap predecessor guard (Phase 7 F7.2 T7.1) for a
-  # block at `height` whose parent is `prev_hash`:
+  # No-gap bootstrap predecessor guard (Phase 7 F7.2 T7.1) for a block at `height`
+  # whose parent is `prev_hash`. **Read-only** — it never mutates the index (note-1061
+  # B2), so a refusal honestly means "nothing mutated":
   #   * predecessor present and matching -> :ok;
-  #   * predecessor present but a different hash -> roll back below it, then refuse
-  #     the child ({:error, :missing_predecessor}) — the canonical branch must be
-  #     reprocessed contiguously through apply_branch/2 first;
+  #   * predecessor present but a different hash -> refuse the child
+  #     ({:error, :missing_predecessor}) WITHOUT rolling back; the divergence is
+  #     corrected by the reconcile-supplied `rollback_to` in a later apply_branch/2
+  #     (the single rollback authority), not here;
   #   * predecessor MISSING -> accepted (:ok) ONLY when this block is exactly the
   #     configured bootstrap block (height == bootstrap.height and, if the bootstrap
   #     is hash-pinned, block_hash == bootstrap.hash); otherwise refused.
@@ -388,11 +402,15 @@ defmodule Athanor.Indexer.BlockProcessor do
         :ok
 
       %{id: stored_hash} ->
+        # A divergent predecessor is detected and REFUSED, but NOT rolled back here
+        # (note-1061 B2): rolling back while returning the "nothing mutated" error shape
+        # corrupts the result contract and leaves `last_height` stale. The reconcile
+        # cycle observes the divergence (by hash) and supplies the authoritative
+        # `rollback_to` to a subsequent `apply_branch/2` — the single rollback path.
         Logger.warning(
-          "REORG detected at height #{expected_height}: expected #{prev_hash}, have #{stored_hash}"
+          "REORG detected at height #{expected_height}: expected #{prev_hash}, have #{stored_hash} — refusing child (reconcile will supply rollback)"
         )
 
-        rollback_to(expected_height - 1)
         {:error, :missing_predecessor}
 
       nil ->
