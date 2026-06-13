@@ -311,9 +311,9 @@ defmodule Athanor.Indexer.BlockProcessor do
     end
   end
 
-  # The persisted bootstrap boundary. Wired to the `IndexerBootstrap` row in T7.S;
-  # until then there is no boundary (every missing predecessor is refused).
-  defp current_bootstrap, do: nil
+  # The persisted bootstrap boundary (`IndexerBootstrap` row). `nil` until captured
+  # at first start, in which case every missing predecessor is refused.
+  defp current_bootstrap, do: Athanor.Indexer.Bootstrap.fetch()
 
   @doc """
   Rolls the index back to `height` after a chain reorg.

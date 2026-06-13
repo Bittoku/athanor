@@ -55,11 +55,12 @@ defmodule Athanor.Indexer.TipController do
   @doc """
   An advisory hint from a realtime producer (`:p2p | :zmq | :junglebus`) that the
   tip may have moved. Coalesced into one RPC-confirmed reconcile cycle; never
-  mutates the index directly. `candidate_tip_hash` is advisory (logged) only.
+  mutates the index directly. `candidate_tip_hash` is advisory only. Always targets
+  the registered controller (`__MODULE__`).
   """
-  @spec hint(GenServer.server(), atom(), binary() | nil) :: :ok
-  def hint(server \\ __MODULE__, source, _candidate_tip_hash \\ nil) do
-    GenServer.cast(server, {:hint, source})
+  @spec hint(atom(), binary() | nil) :: :ok
+  def hint(source, _candidate_tip_hash \\ nil) when is_atom(source) do
+    GenServer.cast(__MODULE__, {:hint, source})
   end
 
   @doc """
@@ -68,7 +69,7 @@ defmodule Athanor.Indexer.TipController do
   the RPC reconcile without granting P2P any index-mutation authority.
   """
   @spec notify_tip(GenServer.server(), tuple()) :: :ok
-  def notify_tip(server \\ __MODULE__, _event), do: hint(server, :p2p)
+  def notify_tip(server \\ __MODULE__, _event), do: GenServer.cast(server, {:hint, :p2p})
 
   ## ── Server callbacks ──
 

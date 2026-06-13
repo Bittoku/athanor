@@ -106,7 +106,10 @@ defmodule Athanor.Blockchain.ZmqListener do
 
   def handle_info({:zmq, _socket, [<<"hashblock", _::binary>>, payload | _rest], _opts}, state) do
     Logger.debug("ZmqListener received hashblock (#{byte_size(payload)} bytes)")
-    GenServer.cast(Athanor.Indexer.BlockProcessor, {:process_block_hash, payload})
+    # Phase 7 F7.2: a hashblock is an advisory **hint** to the single index-tip
+    # mutation owner (`TipController`); it never mutates the index directly. The
+    # controller runs an RPC-confirmed reconcile, applying only what the node confirms.
+    Athanor.Indexer.TipController.hint(:zmq, payload)
     {:noreply, state}
   end
 
