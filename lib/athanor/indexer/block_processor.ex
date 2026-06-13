@@ -26,6 +26,32 @@ defmodule Athanor.Indexer.BlockProcessor do
     GenServer.call(__MODULE__, :last_processed_height)
   end
 
+  @doc """
+  The single, synchronous, ordered index-mutation op (Phase 7 F7.2 T7.1). Rolls the
+  index back to `:rollback_to` (skipped when `nil`), setting `last_height` to the
+  fork height **before** connecting, then applies the **contiguous** new branch
+  `:connect` (display-order block-hash binaries, ancestor→tip), **halting at the
+  first connect failure**. Serialized in the `BlockProcessor` mailbox (a `call`, so
+  it returns its result for the controller's state machine).
+
+  ## Returns
+    * `{:ok, last_height}` — rolled back (if any) and applied every connect block;
+    * `{:partial, last_height, reason}` — rolled back and/or applied a prefix, then
+      halted at `reason`; `last_height` is the last contiguous success;
+    * `{:error, reason}` — nothing was mutated (no rollback and the first connect
+      failed).
+  """
+  @spec apply_branch(GenServer.server(), %{
+          required(:rollback_to) => non_neg_integer() | nil,
+          required(:connect) => [binary()]
+        }) ::
+          {:ok, non_neg_integer()}
+          | {:partial, non_neg_integer(), term()}
+          | {:error, term()}
+  def apply_branch(server \\ __MODULE__, %{rollback_to: rollback_to, connect: connect}) do
+    GenServer.call(server, {:apply_branch, rollback_to, connect})
+  end
+
   ## ── Server Callbacks ──
 
   @impl true
@@ -35,28 +61,67 @@ defmodule Athanor.Indexer.BlockProcessor do
   end
 
   @impl true
-  def handle_cast({:process_block_hash, block_hash_binary}, state) do
-    block_hash_hex = Base.encode16(block_hash_binary, case: :lower)
-    Logger.info("BlockProcessor received block hash: #{block_hash_hex}")
-
-    case process_block(block_hash_hex, state) do
-      {:ok, height} ->
-        {:noreply, %{state | last_height: height, processing: false}}
-
-      {:error, reason} ->
-        Logger.error("BlockProcessor failed: #{inspect(reason)}")
-        {:noreply, %{state | processing: false}}
-    end
-  end
-
-  @impl true
   def handle_call(:last_processed_height, _from, state) do
     {:reply, state.last_height, state}
   end
 
+  def handle_call({:apply_branch, rollback_to, connect_hashes}, _from, state) do
+    {mutated?, state} =
+      if is_integer(rollback_to) do
+        Logger.warning("BlockProcessor: rolling back to height #{rollback_to}")
+        rollback_to(rollback_to)
+        {true, %{state | last_height: rollback_to, processing: false}}
+      else
+        {false, state}
+      end
+
+    {result, state} = connect_branch(connect_hashes, state, mutated?: mutated?)
+    {:reply, result, state}
+  end
+
+  # The public `{:process_block_hash, …}` mutation cast is **removed** (note-1035 B1):
+  # a named-GenServer cast is externally reachable and would bypass the predecessor
+  # guard + result contract. The only index-mutation path is `apply_branch/2`; any
+  # stray cast falls through here and is a no-op (it cannot write contexts).
+  @impl true
+  def handle_cast(_msg, state), do: {:noreply, state}
+
   @impl true
   def handle_info(_msg, state) do
     {:noreply, state}
+  end
+
+  @doc """
+  Connects a contiguous canonical branch onto `state`, halting at the first failed
+  connect, and reports the result contract (see `apply_branch/2`). `opts`:
+  `:mutated?` (whether a rollback already changed the index this op — affects
+  `:partial` vs `:error`), `:process_fun` (`(hash, state -> {:ok, height} |
+  {:error, reason}`, injectable for tests; default the private block processor).
+  Returns `{result, state}`. `@doc false` — public for unit tests only.
+  """
+  @doc false
+  @spec connect_branch([binary()], map(), keyword()) :: {term(), map()}
+  def connect_branch(connect_hashes, state, opts \\ []) do
+    mutated? = Keyword.get(opts, :mutated?, false)
+    process_fun = Keyword.get(opts, :process_fun, &process_connect/2)
+    do_connect(connect_hashes, state, mutated?, process_fun)
+  end
+
+  defp do_connect([], state, _mutated?, _fun), do: {{:ok, state.last_height}, state}
+
+  defp do_connect([hash | rest], state, mutated?, fun) do
+    case fun.(hash, state) do
+      {:ok, height} ->
+        do_connect(rest, %{state | last_height: height, processing: false}, true, fun)
+
+      {:error, reason} ->
+        result = if mutated?, do: {:partial, state.last_height, reason}, else: {:error, reason}
+        {result, %{state | processing: false}}
+    end
+  end
+
+  defp process_connect(hash, state) when is_binary(hash) do
+    process_block(Base.encode16(hash, case: :lower), state)
   end
 
   ## ── Private ──
@@ -74,13 +139,14 @@ defmodule Athanor.Indexer.BlockProcessor do
   end
 
   defp do_process_block(block_hash_hex) do
-    with {:ok, block} <- RpcClient.get_block(block_hash_hex, 2) do
-      height = block["height"]
-      prev_hash = block["previousblockhash"]
-
-      # Reorg detection: check if previous block is our last processed
-      maybe_handle_reorg(prev_hash, height)
-
+    with {:ok, block} <- RpcClient.get_block(block_hash_hex, 2),
+         height = block["height"],
+         prev_hash = block["previousblockhash"],
+         # Reorg detection + no-gap bootstrap guard: a predecessor mismatch rolls
+         # back and refuses the child; a missing predecessor is accepted only at the
+         # configured bootstrap boundary (§5). Everything else is refused so a child
+         # is never recorded over a gap.
+         :ok <- predecessor_status(prev_hash, height, block_hash: block_hash_hex) do
       # Process each transaction in the block
       txids = block["tx"] || []
 
@@ -102,6 +168,16 @@ defmodule Athanor.Indexer.BlockProcessor do
 
       Logger.info("Processed block #{height} (#{block_hash_hex})")
       {:ok, height}
+    else
+      {:error, :missing_predecessor} = err ->
+        Logger.warning(
+          "BlockProcessor: refusing block #{block_hash_hex} — predecessor context missing (no-gap guard)"
+        )
+
+        err
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -172,29 +248,72 @@ defmodule Athanor.Indexer.BlockProcessor do
     end)
   end
 
-  defp maybe_handle_reorg(prev_hash, height) when is_binary(prev_hash) do
+  @doc """
+  Reorg detection + **no-gap bootstrap predecessor guard** (Phase 7 F7.2 T7.1) for a
+  block at `height` whose parent is `prev_hash`:
+
+    * predecessor present and matching → `:ok`;
+    * predecessor present but a different hash → roll back below it, then refuse the
+      child (`{:error, :missing_predecessor}`) — the canonical branch must be
+      reprocessed contiguously through `apply_branch/2` first;
+    * predecessor **missing** → accepted (`:ok`) **only** when this block is exactly
+      the configured **bootstrap** block (`height == bootstrap.height` and, if the
+      bootstrap is hash-pinned, `block_hash == bootstrap.hash`); otherwise refused.
+
+  `opts`: `:bootstrap` (`%{height, hash} | nil`, default the persisted boundary),
+  `:block_hash` (this block's hex id, for the hash-pin check). `@doc false` — public
+  for unit tests only.
+  """
+  @doc false
+  @spec predecessor_status(binary() | nil, non_neg_integer(), keyword()) ::
+          :ok | {:error, :missing_predecessor}
+  def predecessor_status(prev_hash, height, opts \\ [])
+
+  def predecessor_status(prev_hash, height, opts) when is_binary(prev_hash) do
     expected_height = height - 1
 
     case Repo.get_by(BlockProcessContext, height: expected_height) do
-      nil ->
-        # Gap — we might need to catch up, but not necessarily a reorg
-        :ok
-
       %{id: stored_hash} when stored_hash == prev_hash ->
-        # Chain is consistent
         :ok
 
       %{id: stored_hash} ->
-        # Reorg detected!
         Logger.warning(
           "REORG detected at height #{expected_height}: expected #{prev_hash}, have #{stored_hash}"
         )
 
         rollback_to(expected_height - 1)
+        {:error, :missing_predecessor}
+
+      nil ->
+        bootstrap_ok(height, opts)
     end
   end
 
-  defp maybe_handle_reorg(nil, _height), do: :ok
+  def predecessor_status(nil, height, opts), do: bootstrap_ok(height, opts)
+
+  # A missing predecessor is acceptable only at the configured bootstrap boundary.
+  defp bootstrap_ok(height, opts) do
+    bootstrap = Keyword.get(opts, :bootstrap, current_bootstrap())
+    block_hash = Keyword.get(opts, :block_hash)
+
+    cond do
+      is_nil(bootstrap) ->
+        {:error, :missing_predecessor}
+
+      bootstrap.height != height ->
+        {:error, :missing_predecessor}
+
+      not is_nil(bootstrap.hash) and bootstrap.hash != block_hash ->
+        {:error, :missing_predecessor}
+
+      true ->
+        :ok
+    end
+  end
+
+  # The persisted bootstrap boundary. Wired to the `IndexerBootstrap` row in T7.S;
+  # until then there is no boundary (every missing predecessor is refused).
+  defp current_bootstrap, do: nil
 
   @doc """
   Rolls the index back to `height` after a chain reorg.
