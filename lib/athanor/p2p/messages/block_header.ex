@@ -27,4 +27,21 @@ defmodule Athanor.P2P.Messages.BlockHeader do
   def prev_hash(%__MODULE__{raw: <<_version::binary-4, prev::binary-32, _::binary>>}) do
     Hash.wire_to_display(prev)
   end
+
+  @doc """
+  The previous-block id (header bytes 4..35) in **wire/internal order** — the raw
+  `prev_block` bytes, *not* reversed. This is the parent-link convention the
+  headers chain keys on (it matches `hash/1`); display-order `prev_hash/1` is for
+  the store boundary only.
+  """
+  @spec prev_hash_wire(t()) :: <<_::256>>
+  def prev_hash_wire(%__MODULE__{raw: <<_version::binary-4, prev::binary-32, _::binary>>}),
+    do: prev
+
+  @doc """
+  The compact difficulty target (`nBits`) as a `uint32`, read from the 4-byte
+  little-endian `bits` field (header bytes 72..75).
+  """
+  @spec bits(t()) :: 0..0xFFFFFFFF
+  def bits(%__MODULE__{raw: <<_::binary-72, bits::little-32, _nonce::binary-4>>}), do: bits
 end
