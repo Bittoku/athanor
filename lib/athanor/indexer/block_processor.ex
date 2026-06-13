@@ -26,29 +26,6 @@ defmodule Athanor.Indexer.BlockProcessor do
     GenServer.call(__MODULE__, :last_processed_height)
   end
 
-  @doc """
-  Applies a P2P reorg as a **single ordered mailbox operation**: roll the index
-  back to `fork_height` (skipped when `nil` — no recorded common ancestor), then
-  process the new branch `connect_hashes` (display-order block-hash binaries,
-  ancestor→tip) in order.
-
-  Routing rollback + new-branch enqueue through this one cast serializes them
-  behind any already-queued `process_block_hash` work, so a rollback can never
-  interleave with in-flight block writes (Phase 6 §C; Hermes !18 note 932).
-
-  ## Parameters
-    - `server` — the BlockProcessor (defaults to the registered name).
-    - `fork_height` — common-ancestor height to roll back to, or `nil` to skip.
-    - `connect_hashes` — new-branch block hashes (display order) to process.
-
-  ## Returns
-    `:ok` (cast).
-  """
-  @spec apply_reorg(GenServer.server(), non_neg_integer() | nil, [binary()]) :: :ok
-  def apply_reorg(server \\ __MODULE__, fork_height, connect_hashes) do
-    GenServer.cast(server, {:apply_reorg, fork_height, connect_hashes})
-  end
-
   ## ── Server Callbacks ──
 
   @impl true
@@ -70,54 +47,6 @@ defmodule Athanor.Indexer.BlockProcessor do
         Logger.error("BlockProcessor failed: #{inspect(reason)}")
         {:noreply, %{state | processing: false}}
     end
-  end
-
-  def handle_cast({:apply_reorg, fork_height, connect_hashes}, state) do
-    # After a successful rollback, `last_height` MUST drop to the fork height before
-    # connecting the new branch — otherwise an empty/failed connect would leave the
-    # GenServer advertising the orphaned tip height while the DB is rolled back
-    # (Hermes !18 note 941 B3). Each connect block then advances it; a failing
-    # connect leaves it at the last successfully processed height.
-    state =
-      if is_integer(fork_height) do
-        Logger.warning("BlockProcessor: P2P reorg — rolling back to height #{fork_height}")
-        rollback_to(fork_height)
-        %{state | last_height: fork_height, processing: false}
-      else
-        state
-      end
-
-    {:noreply, connect_branch(connect_hashes, state)}
-  end
-
-  @doc """
-  Connects a contiguous canonical branch (display-order block-hash binaries,
-  ancestor→tip) onto `state`, **halting at the first failed connect** so a
-  transient failure for block `N` can never let `N+1` be recorded over a gap
-  (Hermes !18 note 945 B3). `last_height` ends at the last successfully processed
-  contiguous height. `process_fun` is injectable for testing; it defaults to the
-  real per-block processor.
-
-  ## Returns
-    The updated `state`.
-  """
-  @spec connect_branch(
-          [binary()],
-          map(),
-          (binary(), map() -> {:ok, non_neg_integer()} | {:error, term()})
-        ) ::
-          map()
-  def connect_branch(connect_hashes, state, process_fun \\ &process_connect/2) do
-    Enum.reduce_while(connect_hashes, state, fn hash, acc ->
-      case process_fun.(hash, acc) do
-        {:ok, height} ->
-          {:cont, %{acc | last_height: height, processing: false}}
-
-        {:error, reason} ->
-          Logger.error("BlockProcessor: reorg connect block failed (#{inspect(reason)}); halting")
-          {:halt, %{acc | processing: false}}
-      end
-    end)
   end
 
   @impl true
@@ -144,18 +73,14 @@ defmodule Athanor.Indexer.BlockProcessor do
     end
   end
 
-  defp process_connect(hash, state) when is_binary(hash) do
-    process_block(Base.encode16(hash, case: :lower), state)
-  end
-
   defp do_process_block(block_hash_hex) do
-    with {:ok, block} <- RpcClient.get_block(block_hash_hex, 2),
-         height = block["height"],
-         prev_hash = block["previousblockhash"],
-         # Reorg detection + no-gap guard: a non-genesis block whose predecessor
-         # context is missing (on a non-empty index) is refused, so a transient
-         # failure for an earlier height can never record a child over a gap.
-         :ok <- maybe_handle_reorg(prev_hash, height) do
+    with {:ok, block} <- RpcClient.get_block(block_hash_hex, 2) do
+      height = block["height"]
+      prev_hash = block["previousblockhash"]
+
+      # Reorg detection: check if previous block is our last processed
+      maybe_handle_reorg(prev_hash, height)
+
       # Process each transaction in the block
       txids = block["tx"] || []
 
@@ -177,16 +102,6 @@ defmodule Athanor.Indexer.BlockProcessor do
 
       Logger.info("Processed block #{height} (#{block_hash_hex})")
       {:ok, height}
-    else
-      {:error, :missing_predecessor} = err ->
-        Logger.warning(
-          "BlockProcessor: refusing block #{block_hash_hex} — predecessor context missing (no-gap guard)"
-        )
-
-        err
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
@@ -257,51 +172,29 @@ defmodule Athanor.Indexer.BlockProcessor do
     end)
   end
 
-  # Reorg detection + no-gap predecessor guard for a block at `height` whose parent
-  # is `prev_hash` (Hermes !18 note 945 B3):
-  #   * predecessor context present and matching -> :ok (chain consistent);
-  #   * predecessor context present but a different hash -> reorg: roll back below
-  #     it, then :ok;
-  #   * predecessor context missing:
-  #       - on an EMPTY index -> :ok (the genuine first block has no predecessor);
-  #       - on a NON-EMPTY index -> {:error, :missing_predecessor}: recording this
-  #         block would leave a gap (its parent was never processed) -> refused.
-  # Public (but `@doc false`) only so the no-gap guard is unit-testable.
-  @doc false
-  @spec maybe_handle_reorg(binary() | nil, non_neg_integer()) ::
-          :ok | {:error, :missing_predecessor}
-  def maybe_handle_reorg(prev_hash, height) when is_binary(prev_hash) do
+  defp maybe_handle_reorg(prev_hash, height) when is_binary(prev_hash) do
     expected_height = height - 1
 
     case Repo.get_by(BlockProcessContext, height: expected_height) do
       nil ->
-        # No predecessor context. Allow only when the index is empty (a genuine
-        # cold start at this height); otherwise refuse — recording over the gap
-        # would let a child be stored without its parent.
-        if index_empty?(), do: :ok, else: {:error, :missing_predecessor}
+        # Gap — we might need to catch up, but not necessarily a reorg
+        :ok
 
       %{id: stored_hash} when stored_hash == prev_hash ->
         # Chain is consistent
         :ok
 
       %{id: stored_hash} ->
-        # Reorg detected: the orphaned branch is rolled back below the divergence,
-        # but the current child is REFUSED (note 979 B2). After the rollback its
-        # predecessor context is gone, so recording it now would leave a gap; the
-        # canonical ancestor→tip branch must be reprocessed through the ordered
-        # reorg/catch-up path (which fetches it contiguously) first.
+        # Reorg detected!
         Logger.warning(
           "REORG detected at height #{expected_height}: expected #{prev_hash}, have #{stored_hash}"
         )
 
         rollback_to(expected_height - 1)
-        {:error, :missing_predecessor}
     end
   end
 
-  def maybe_handle_reorg(nil, _height), do: :ok
-
-  defp index_empty?, do: not Repo.exists?(BlockProcessContext)
+  defp maybe_handle_reorg(nil, _height), do: :ok
 
   @doc """
   Rolls the index back to `height` after a chain reorg.

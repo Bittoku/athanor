@@ -23,9 +23,10 @@ defmodule Athanor.P2P.HeadersChain do
       unsolicited junk, and resets on progress or a peer change. After
       `:max_detached_rounds` consecutive solicited detached rounds from the same
       peer the fork is deeper than the window, so `:on_tip` is signalled
-      `{:reorg_too_deep, …}` (operator alert + RPC fallback, §C) and the counter
-      resets. This prevents one peer from forcing a global authority suspension
-      with unauthenticated headers.
+      `{:reorg_too_deep, …}` and the counter resets. This prevents one peer from
+      forcing a global escalation with unauthenticated headers. (Phase 6 surfaces
+      all tip events for detection/logging; **driving the index** from them — the
+      RPC↔P2P authority handoff and no-gap recovery — is the Phase 7 follow-up.)
     * **`:tick`** → periodic `:prune` + an opportunistic `getheaders`.
 
   Fail-closed (Phase-5 consistency): every external call (`PeerRegistry.pids/1`,
@@ -64,9 +65,9 @@ defmodule Athanor.P2P.HeadersChain do
 
   @doc """
   The height of the chain's window root (the synthetic seed height), or `nil` if
-  the chain is not yet seeded. The `ChainTipVerifier` uses this to keep RPC
-  catch-up active until the local index has reached the P2P seed (Hermes !18 note
-  945 B1) before deferring tip authority to P2P.
+  the chain is not yet seeded. Exposed for the Phase 7 index integration (to keep
+  RPC catch-up active until the local index reaches the P2P seed before deferring
+  tip authority to P2P); unused by the Phase 6 detection-only sink.
   """
   @spec root_height(GenServer.server()) :: non_neg_integer() | nil
   def root_height(server \\ __MODULE__), do: GenServer.call(server, :root_height)
