@@ -76,7 +76,10 @@ defmodule Athanor.Indexer.TipControllerTest do
   end
 
   test "a deferred catch-up is replayed to the node tip without a new hint" do
-    {:ok, agent} = Agent.start_link(fn -> 90 end)
+    # Start far enough below the tip that catch-up needs >1 batch: each
+    # `{:ok, last_height < node_tip}` folds to :progressed and self-schedules a
+    # replay until `{:ok, node_tip}` folds to :synced.
+    {:ok, agent} = Agent.start_link(fn -> 80 end)
     node_hashes = for h <- 0..100, into: %{}, do: {h, hex(h)}
 
     pid =
@@ -172,5 +175,96 @@ defmodule Athanor.Indexer.TipControllerTest do
     TipController.notify_tip(:tc_notify_test, {:extend, [<<0::256>>]})
     _ = drain(pid)
     assert_received {:applied, %{connect: [_ | _]}}
+  end
+
+  # ── note-1049 B2: fold the explicit `apply_branch/2` result contract ──
+  # The controller's authority phase must be driven by the ordered mutation owner's
+  # synchronous result, not inferred from a `local_height` side-effect read.
+
+  test "{:ok, last_height} at the node tip folds to :synced with no self-scheduled replay" do
+    node_hashes = %{5 => hex(5), 6 => hex(6), 7 => hex(7)}
+    {:ok, local} = Agent.start_link(fn -> 5 end)
+    {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+    # The startup `:ensure_bootstrap` continue is itself the single reconcile trigger
+    # here (no manual hint), so the apply count proves the *fold*: a result at the
+    # node tip settles to :synced and does NOT self-schedule another cycle.
+    pid =
+      start_controller(
+        rpc_height: fn -> {:ok, 7} end,
+        rpc_hash_at: fn h -> node_hashes[h] end,
+        local_height: fn -> Agent.get(local, & &1) end,
+        local_hash_at: fn h -> if h <= Agent.get(local, & &1), do: node_hashes[h], else: nil end,
+        # The apply reaches the node tip → authoritative {:ok, 7}.
+        apply_fun: fn _p, _a ->
+          Agent.update(calls, &(&1 + 1))
+          Agent.update(local, fn _ -> 7 end)
+          {:ok, 7}
+        end
+      )
+
+    state = drain(pid)
+
+    assert state.machine.phase == :synced
+    # :synced from the result ⇒ no self-scheduled replay: exactly one apply.
+    assert Agent.get(calls, & &1) == 1
+  end
+
+  test "a {:partial, last_height, _} that advanced folds to :progressed and replays to the tip" do
+    {:ok, agent} = Agent.start_link(fn -> 80 end)
+    node_hashes = for h <- 0..100, into: %{}, do: {h, hex(h)}
+
+    pid =
+      start_controller(
+        rpc_height: fn -> {:ok, 100} end,
+        rpc_hash_at: fn h -> node_hashes[h] end,
+        local_height: fn -> Agent.get(agent, & &1) end,
+        local_hash_at: fn h ->
+          if h <= Agent.get(agent, & &1), do: node_hashes[h], else: nil
+        end,
+        # A prefix applies (height advances) but the batch trails the tip → {:partial}
+        # while below 100, {:ok, 100} once caught up. A partial that *advanced* must
+        # still schedule a replay.
+        apply_fun: fn _p, arg ->
+          Agent.update(agent, &(&1 + length(arg.connect)))
+          h = Agent.get(agent, & &1)
+          if h >= 100, do: {:ok, h}, else: {:partial, h, :rpc_block_unavailable}
+        end,
+        batch: 10
+      )
+
+    GenServer.cast(pid, {:hint, :p2p})
+    state = drain(pid)
+
+    assert Agent.get(agent, & &1) == 100
+    assert state.machine.phase == :synced
+  end
+
+  test "a rollback-only partial with no forward progress folds to :deferred without spinning" do
+    node_hashes = %{5 => hex(5), 6 => hex(6), 7 => hex(7)}
+    {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+    pid =
+      start_controller(
+        rpc_height: fn -> {:ok, 7} end,
+        rpc_hash_at: fn h -> node_hashes[h] end,
+        local_height: fn -> 5 end,
+        local_hash_at: fn h -> if(h == 5, do: hex(5), else: nil) end,
+        # The connect failed on its first block: a rollback/no-prefix partial reports
+        # `last_height` at-or-below where we started. No forward progress ⇒ no replay.
+        apply_fun: fn _p, _a ->
+          Agent.update(calls, &(&1 + 1))
+          {:partial, 5, :connect_failed}
+        end
+      )
+
+    # The startup continue is the single trigger; a no-forward-progress partial must
+    # fold to :deferred and NOT self-schedule, so the apply runs exactly once (a spin
+    # would re-fire until the drain bound).
+    state = drain(pid)
+
+    refute state.machine.in_flight
+    assert Agent.get(calls, & &1) == 1
+    assert state.machine.phase == :bootstrapping
   end
 end

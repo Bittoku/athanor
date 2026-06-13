@@ -77,6 +77,10 @@ defmodule Athanor.Indexer.TipController do
   def init(opts) do
     state = %{
       machine: Machine.new(),
+      # Whether the bootstrap boundary is captured + (on a fresh index) anchored. The
+      # reconcile cycle is gated on this so a transient nil boundary hash never lets a
+      # fresh index plan a spurious catch-up from height 1 (note-1049 B1).
+      bootstrapped: false,
       rpc_height: Keyword.get(opts, :rpc_height, &default_rpc_height/0),
       rpc_hash_at: Keyword.get(opts, :rpc_hash_at, &default_rpc_hash_at/1),
       local_height: Keyword.get(opts, :local_height, &default_local_height/0),
@@ -141,28 +145,36 @@ defmodule Athanor.Indexer.TipController do
 
   ## ── Private ──
 
-  # Capture the bootstrap boundary once (note-1045 B1): resolve the configured
-  # height/hash (or the current RPC node tip), persist it, and — on a fresh index —
-  # record the anchor block so the predecessor guard has its contiguous start. A
-  # no-op if already captured; defers (retried on tick) if RPC is unavailable.
+  # Capture the bootstrap boundary once and anchor it **atomically** (note-1045 B1,
+  # tightened per note-1049 B1): resolve the configured height/hash (or the current
+  # RPC node tip), and only persist the singleton row once the boundary **hash** is
+  # available — so a fresh index can be anchored in the same step. Because
+  # `Bootstrap.ensure/2` is capture-once/idempotent, persisting with a transient nil
+  # hash would strand the index anchorless forever; instead we defer and retry on the
+  # next tick. Marks `:bootstrapped` once the boundary exists so the reconcile cycle
+  # may run; a no-op if already captured.
+  defp ensure_bootstrap(%{bootstrapped: true} = state), do: state
+
   defp ensure_bootstrap(state) do
     case state.bootstrap_fetch.() do
       nil ->
         case resolve_bootstrap(state) do
-          {:ok, height, hash} ->
+          {:ok, height, hash} when is_binary(hash) ->
             state.bootstrap_ensure.(height, hash)
 
-            if is_binary(hash) and state.local_height.() == 0,
+            if state.local_height.() == 0,
               do: state.anchor_fun.(state.processor, height, hash)
 
-            state
+            %{state | bootstrapped: true}
 
-          :defer ->
+          # Boundary hash unavailable (RPC/hash-lookup gap) — do not persist an
+          # unanchorable singleton; retry capture on the next tick.
+          _ ->
             state
         end
 
       _existing ->
-        state
+        %{state | bootstrapped: true}
     end
   end
 
@@ -192,7 +204,11 @@ defmodule Athanor.Indexer.TipController do
   end
 
   # One RPC-confirmed reconcile cycle → a `{:cycle_result, …}` symbol for the
-  # Machine. Fails closed on any RPC/apply error (`:deferred`).
+  # Machine. Fails closed on any RPC/apply error (`:deferred`). Gated on
+  # `:bootstrapped` so the cycle never runs (and never plans a catch-up from height
+  # 1) before the boundary is captured + anchored (note-1049 B1).
+  defp run_cycle(%{bootstrapped: false}), do: :deferred
+
   defp run_cycle(state) do
     case safe_rpc_height(state) do
       {:ok, node_height} ->
@@ -209,7 +225,7 @@ defmodule Athanor.Indexer.TipController do
         case Reconcile.branch_for(plan, state.rpc_hash_at, state.batch) do
           :synced -> :synced
           :defer -> :deferred
-          {:apply, arg} -> apply_outcome(state, arg, local_before)
+          {:apply, arg} -> apply_outcome(state, arg, node_height, local_before)
         end
 
       :error ->
@@ -217,14 +233,25 @@ defmodule Athanor.Indexer.TipController do
     end
   end
 
-  # Dispatch the branch, then decide progress by **actual advancement**: a cycle is
-  # `:progressed` (schedule a follow-up) only if the index moved forward; an apply
-  # that errored, partially applied at the same height, or didn't advance is
-  # `:deferred` (wait for the next trigger) — so a persistently-failing connect
-  # block or a stuck node can never spin the controller.
-  defp apply_outcome(state, arg, local_before) do
-    _ = safe_apply(state, arg)
-    if state.local_height.() > local_before, do: :progressed, else: :deferred
+  # Dispatch the branch and fold the **explicit `apply_branch/2` result** — the
+  # ordered mutation owner's authoritative contract — into a cycle symbol for the
+  # Machine (note-1049 B2). Authority is taken from the returned `last_height`, not a
+  # `local_height` side-effect read:
+  #
+  #   * `{:ok, last_height}` at/above the node tip → `:synced` (no replay);
+  #   * `{:ok, last_height}` below the tip → `:progressed` (a batch landed; replay);
+  #   * `{:partial, last_height, _}` that advanced past `local_before` → `:progressed`
+  #     (a prefix landed; replay retries the failed block from the new height);
+  #   * `{:error, _}` (failed first connect block, nothing mutated) and any
+  #     rollback-only / no-forward-progress partial → `:deferred` (wait for the next
+  #     trigger) — so a persistently-failing block or stuck node can never spin.
+  defp apply_outcome(state, arg, node_height, local_before) do
+    case safe_apply(state, arg) do
+      {:ok, last_height} when last_height >= node_height -> :synced
+      {:ok, last_height} when last_height > local_before -> :progressed
+      {:partial, last_height, _reason} when last_height > local_before -> :progressed
+      _ -> :deferred
+    end
   end
 
   defp safe_apply(state, arg) do

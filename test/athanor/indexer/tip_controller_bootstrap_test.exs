@@ -97,4 +97,68 @@ defmodule Athanor.Indexer.TipControllerBootstrapTest do
     assert Bootstrap.fetch() == %{height: 200, hash: hex(200)}
     assert Repo.get(BlockProcessContext, hex(200)).height == 200
   end
+
+  test "a transient nil boundary hash leaves no unanchored singleton; a later tick captures + catches up" do
+    # note-1049 B1: capture must be atomic with anchor recording. If `rpc_hash_at`
+    # for the boundary height is transiently unavailable at startup, the singleton
+    # bootstrap row must NOT be persisted (it is capture-once/idempotent) — otherwise
+    # a fresh index is left anchorless forever and fails closed. The capture must
+    # retry on a later tick once the hash resolves.
+    assert Bootstrap.fetch() == nil
+
+    node = for h <- 103..105, into: %{}, do: {h, hex(h)}
+    {:ok, gate} = Agent.start_link(fn -> false end)
+
+    apply_fun = fn _p, %{rollback_to: rb, connect: connect} ->
+      start = (rb || BlockProcessor.last_processed_height()) + 1
+
+      heights =
+        if connect == [], do: [], else: Enum.to_list(start..(start + length(connect) - 1))
+
+      for h <- heights do
+        Repo.insert!(%BlockProcessContext{
+          id: node[h],
+          height: h,
+          processed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+        })
+      end
+
+      {:ok, List.last(heights) || start - 1}
+    end
+
+    proc = start_supervised!({BlockProcessor, []})
+
+    pid =
+      start_supervised!({
+        TipController,
+        # No configured hash → the boundary hash must come from `rpc_hash_at`, which
+        # is gated nil until we open it below.
+        name: TipController,
+        bootstrap_height: 103,
+        bootstrap_hash: nil,
+        rpc_height: fn -> {:ok, 105} end,
+        rpc_hash_at: fn h ->
+          if h == 103 and not Agent.get(gate, & &1), do: nil, else: node[h]
+        end,
+        apply_fun: apply_fun,
+        processor: proc,
+        tick_interval_ms: 60_000
+      })
+
+    _ = drain(pid)
+
+    # First startup: boundary hash unavailable → nothing persisted, nothing anchored,
+    # and the reconcile cycle is gated (no spurious catch-up from height 1).
+    assert Bootstrap.fetch() == nil
+    assert Repo.aggregate(BlockProcessContext, :count) == 0
+
+    # The hash resolves; a tick retries capture and then catches up contiguously.
+    Agent.update(gate, fn _ -> true end)
+    send(pid, :tick)
+    _ = drain(pid)
+
+    assert Bootstrap.fetch() == %{height: 103, hash: hex(103)}
+    heights = Repo.all(BlockProcessContext) |> Enum.map(& &1.height) |> Enum.sort()
+    assert heights == [103, 104, 105]
+  end
 end
