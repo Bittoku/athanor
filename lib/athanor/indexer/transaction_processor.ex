@@ -38,6 +38,20 @@ defmodule Athanor.Indexer.TransactionProcessor do
     )
   end
 
+  @doc """
+  Index a matched transaction **in the calling process** (note-1065). Unlike
+  `process_tx/4` (a cross-process `GenServer.call` whose Repo writes land on the
+  TransactionProcessor's own connection), this runs the full indexing pipeline on the
+  **caller's** connection — so block processing can wrap this and the
+  `block_process_contexts` insert in ONE `Repo.transaction` and have a failed context
+  insert roll back the MetaTransaction/UTXO/address-history side effects too. Returns
+  `{:ok, txid_hex} | {:error, reason}`. The GenServer `process_tx/4` / `{:index_tx}`
+  cast remain for realtime (mempool) indexing, where per-block atomicity is not needed.
+  """
+  def index_tx(tx, matched_addresses, matched_tokens, source \\ :unknown) do
+    do_index_tx(tx, matched_addresses, matched_tokens, nil, source)
+  end
+
   ## ── Server Callbacks ──
 
   @impl true
@@ -161,11 +175,44 @@ defmodule Athanor.Indexer.TransactionProcessor do
       metadata: Map.put(stas_attrs.flags, "sources", merge_sources(nil, source))
     }
 
-    _meta_result =
-      %MetaTransaction{}
-      |> MetaTransaction.changeset(meta_attrs)
-      |> Repo.insert()
+    # Check + propagate the first-sight insert (note-1065): a failed insert must
+    # surface so a caller running this inside a transaction (block recording) fails
+    # closed and rolls the whole per-block mutation back, rather than continuing the
+    # side-effect pipeline against a poisoned transaction.
+    case %MetaTransaction{}
+         |> MetaTransaction.changeset(meta_attrs)
+         |> Repo.insert() do
+      {:error, changeset} ->
+        {:error, {:meta_insert_failed, changeset}}
 
+      {:ok, _meta} ->
+        index_tx_effects(
+          tx,
+          classified,
+          stas_attrs,
+          matched_addresses,
+          matched_tokens,
+          block_height,
+          txid_binary,
+          txid_hex
+        )
+    end
+  end
+
+  # The first-sight side-effect pipeline (input spends → UTXO creation → address
+  # history → PubSub → waiter reprocessing), run only AFTER a successful
+  # MetaTransaction insert. Split out of `index_new_tx/7` (note-1065) so a failed
+  # meta insert fails closed without running these effects.
+  defp index_tx_effects(
+         tx,
+         classified,
+         stas_attrs,
+         matched_addresses,
+         matched_tokens,
+         block_height,
+         txid_binary,
+         txid_hex
+       ) do
     # 2. Process inputs — mark UTXOs as spent. STAS 3.0 spec v0.1 §8.2 / §9.6:
     # the unlocking script encodes a `spendType` byte that classifies the
     # operation (transfer / freeze_unfreeze / confiscation / swap_cancel).

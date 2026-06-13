@@ -10,8 +10,8 @@ defmodule Athanor.Indexer.BlockProcessorApplyBranchTest do
   """
   use Athanor.DataCase, async: false
 
-  alias Athanor.Indexer.BlockProcessor
-  alias Athanor.Schema.{BlockProcessContext, MetaTransaction}
+  alias Athanor.Indexer.{BlockProcessor, TransactionProcessor}
+  alias Athanor.Schema.{AddressHistory, BlockProcessContext, MetaTransaction, Utxo}
 
   defp state(last_height), do: %{last_height: last_height, processing: false}
 
@@ -260,6 +260,87 @@ defmodule Athanor.Indexer.BlockProcessorApplyBranchTest do
     test "a fresh block records its context and returns {:ok, height}" do
       assert {:ok, 170} = BlockProcessor.record_block("block-170", 170, [])
       assert Repo.get(BlockProcessContext, "block-170").height == 170
+    end
+  end
+
+  # A matched P2PKH tx fixture (same shape the TransactionProcessor tests use): one
+  # P2PKH output to `pkh`, so `index_tx/4` writes a MetaTransaction, a UTXO, and an
+  # address-history row.
+  defp p2pkh_tx(pkh) do
+    %BSV.Transaction{
+      version: 1,
+      inputs: [
+        %BSV.Transaction.Input{
+          source_txid: :crypto.strong_rand_bytes(32),
+          source_tx_out_index: 0,
+          unlocking_script: %BSV.Script{chunks: []},
+          sequence_number: 0xFFFFFFFF
+        }
+      ],
+      outputs: [
+        %BSV.Transaction.Output{satoshis: 1000, locking_script: BSV.Script.p2pkh_lock(pkh)}
+      ],
+      lock_time: 0
+    }
+  end
+
+  describe "record_block/4 is atomic with the matched-tx side effects (note-1065)" do
+    test "a failed context insert rolls back the matched block-tx meta/UTXO/address-history" do
+      pkh = :binary.copy(<<0x55>>, 20)
+      address = BSV.Base58.check_encode(pkh, 0x00)
+      tx = p2pkh_tx(pkh)
+
+      # Occupy height 300 so the block-context insert conflicts and forces a rollback.
+      Repo.insert!(%BlockProcessContext{id: "other-300", height: 300, processed_at: now()})
+
+      # The REAL matched-tx indexing (inline `index_tx/4`, no RPC), running inside
+      # record_block's transaction alongside the failing context insert.
+      index_fun = fn _tx_data, _h, _bh ->
+        case TransactionProcessor.index_tx(tx, [address], [], :block) do
+          {:ok, _} -> :ok
+          err -> err
+        end
+      end
+
+      assert {:error, {:context_insert_failed, _}} =
+               BlockProcessor.record_block("new-300", 300, ["t"], index_fun: index_fun)
+
+      # No side effects survived without a durable context row.
+      assert Repo.aggregate(MetaTransaction, :count) == 0
+      assert Repo.aggregate(Utxo, :count) == 0
+      assert Repo.aggregate(AddressHistory, :count) == 0
+      assert is_nil(Repo.get(BlockProcessContext, "new-300"))
+    end
+
+    test "a successful record commits the matched-tx side effects together with the context" do
+      pkh = :binary.copy(<<0x56>>, 20)
+      address = BSV.Base58.check_encode(pkh, 0x00)
+      tx = p2pkh_tx(pkh)
+
+      index_fun = fn _tx_data, _h, _bh ->
+        case TransactionProcessor.index_tx(tx, [address], [], :block) do
+          {:ok, _} -> :ok
+          err -> err
+        end
+      end
+
+      assert {:ok, 301} =
+               BlockProcessor.record_block("blk-301", 301, ["t"], index_fun: index_fun)
+
+      assert Repo.get(BlockProcessContext, "blk-301").height == 301
+      assert Repo.aggregate(MetaTransaction, :count) == 1
+      assert Repo.aggregate(Utxo, :count) == 1
+    end
+
+    test "a tx-indexing error fails the block closed (no context, no partial side effects)" do
+      # The injected indexer reports a failure → record_block must roll back and return
+      # {:error, {:tx_index_failed, _}} without recording the context.
+      index_fun = fn _tx_data, _h, _bh -> {:error, :boom} end
+
+      assert {:error, {:tx_index_failed, :boom}} =
+               BlockProcessor.record_block("blk-302", 302, ["t"], index_fun: index_fun)
+
+      assert is_nil(Repo.get(BlockProcessContext, "blk-302"))
     end
   end
 

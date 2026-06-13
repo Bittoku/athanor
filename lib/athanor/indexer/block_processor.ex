@@ -266,17 +266,29 @@ defmodule Athanor.Indexer.BlockProcessor do
   # `predecessor_status/3`. It is a plain function (no externally-reachable message), so
   # it does not reintroduce a mutation path that bypasses the ordered op (note-1035).
   @doc false
-  @spec record_block(String.t(), non_neg_integer(), [map() | binary()]) ::
+  @spec record_block(String.t(), non_neg_integer(), [map() | binary()], keyword()) ::
           {:ok, non_neg_integer()} | {:error, term()}
-  def record_block(block_hash_hex, height, txids) do
+  def record_block(block_hash_hex, height, txids, opts \\ []) do
+    # `:index_fun` ((tx_data, height, block_hash_hex) -> :ok | {:error, reason}) indexes
+    # one block tx; default the real fetch+filter+index path. Injectable so a regression
+    # can drive a matched-tx index without RPC. Crucially it runs INLINE — in this
+    # process, inside the transaction below — so its MetaTransaction/UTXO/address-history
+    # writes share the connection with the context insert (note-1065).
+    index_fun = Keyword.get(opts, :index_fun, &process_block_tx/3)
+
     result =
       Repo.transaction(fn ->
-        Enum.each(txids, fn tx_data -> process_block_tx(tx_data, height, block_hash_hex) end)
-        confirm_block_txs(txids, height, block_hash_hex)
+        case index_block_txs(txids, height, block_hash_hex, index_fun) do
+          {:error, reason} ->
+            Repo.rollback({:tx_index_failed, reason})
 
-        case insert_block_context(block_hash_hex, height) do
-          {:ok, _row} -> :recorded
-          {:error, changeset} -> Repo.rollback({:context_insert_failed, changeset})
+          :ok ->
+            confirm_block_txs(txids, height, block_hash_hex)
+
+            case insert_block_context(block_hash_hex, height) do
+              {:ok, _row} -> :recorded
+              {:error, changeset} -> Repo.rollback({:context_insert_failed, changeset})
+            end
         end
       end)
 
@@ -291,6 +303,17 @@ defmodule Athanor.Indexer.BlockProcessor do
         )
 
         {:error, reason}
+    end
+  end
+
+  # Index each block tx through `index_fun`, halting (and failing closed) at the first
+  # indexing error so the caller's transaction rolls the whole per-block mutation back.
+  defp index_block_txs([], _height, _block_hash_hex, _fun), do: :ok
+
+  defp index_block_txs([tx_data | rest], height, block_hash_hex, fun) do
+    case fun.(tx_data, height, block_hash_hex) do
+      :ok -> index_block_txs(rest, height, block_hash_hex, fun)
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -312,29 +335,26 @@ defmodule Athanor.Indexer.BlockProcessor do
     # Block verbosity=2 gives us full tx data as maps
     txid_hex = tx_data["txid"] || tx_data["hash"]
 
-    case RpcClient.get_raw_transaction(txid_hex, false) do
-      {:ok, raw_hex} ->
-        case Base.decode16(raw_hex, case: :mixed) do
-          {:ok, raw_binary} ->
-            case BSV.Transaction.from_binary(raw_binary) do
-              {:ok, tx, _rest} ->
-                {matched_addrs, matched_tokens} = TransactionFilter.matches?(tx)
+    with {:ok, raw_hex} <- RpcClient.get_raw_transaction(txid_hex, false),
+         {:ok, raw_binary} <- Base.decode16(raw_hex, case: :mixed),
+         {:ok, tx, _rest} <- BSV.Transaction.from_binary(raw_binary) do
+      {matched_addrs, matched_tokens} = TransactionFilter.matches?(tx)
 
-                if matched_addrs != [] or matched_tokens != [] do
-                  # Source-tag the observation (Phase 3 §A): block indexing → `:block`.
-                  TransactionProcessor.process_tx(tx, matched_addrs, matched_tokens, :block)
-                end
-
-              _ ->
-                :ok
-            end
-
-          :error ->
-            :ok
+      if matched_addrs != [] or matched_tokens != [] do
+        # Source-tag the observation (Phase 3 §A): block indexing → `:block`. INLINE
+        # via `index_tx/4` (note-1065): runs in THIS process so its writes share the
+        # block-recording transaction; a failure propagates so the block fails closed.
+        case TransactionProcessor.index_tx(tx, matched_addrs, matched_tokens, :block) do
+          {:ok, _txid} -> :ok
+          {:error, reason} -> {:error, reason}
         end
-
-      {:error, _} ->
+      else
         :ok
+      end
+    else
+      # A tx we cannot fetch/decode is skipped (unchanged behavior) — that is an
+      # un-indexable observation, not a block-recording failure.
+      _ -> :ok
     end
   end
 
