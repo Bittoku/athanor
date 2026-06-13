@@ -11,7 +11,7 @@ defmodule Athanor.Indexer.BlockProcessorApplyBranchTest do
   use Athanor.DataCase, async: false
 
   alias Athanor.Indexer.BlockProcessor
-  alias Athanor.Schema.BlockProcessContext
+  alias Athanor.Schema.{BlockProcessContext, MetaTransaction}
 
   defp state(last_height), do: %{last_height: last_height, processing: false}
 
@@ -164,6 +164,49 @@ defmodule Athanor.Indexer.BlockProcessorApplyBranchTest do
 
       # No context was written — the only mutation path is apply_branch/2.
       assert Repo.aggregate(BlockProcessContext, :count) == 0
+    end
+  end
+
+  describe "record_block/3 is atomic with the durable context (note-1057)" do
+    test "a failed context insert returns {:error, _} and records no context for the block" do
+      # A different block already occupies height 150 → the unique-height constraint
+      # makes the new block's context insert fail. The processor must NOT report the
+      # block applied: it returns {:error, _} so connect_branch halts and the
+      # controller defers, and no context row is written for the new block.
+      Repo.insert!(%BlockProcessContext{id: "other-150", height: 150, processed_at: now()})
+
+      assert {:error, {:context_insert_failed, _}} =
+               BlockProcessor.record_block("new-150", 150, [])
+
+      assert is_nil(Repo.get(BlockProcessContext, "new-150"))
+      assert Repo.aggregate(BlockProcessContext, :count) == 1
+    end
+
+    test "per-block confirmation side effects roll back when the context insert fails" do
+      txid = :crypto.strong_rand_bytes(32)
+      txid_hex = Base.encode16(txid, case: :lower)
+      # A real (valid-hex) block hash so the confirmation path decodes it.
+      block_hash_hex = String.duplicate("ab", 32)
+
+      {:ok, meta} =
+        %MetaTransaction{}
+        |> MetaTransaction.changeset(%{txid: txid, hex: "00", timestamp: 0, is_confirmed: false})
+        |> Repo.insert()
+
+      # Same height already taken → the in-transaction context insert fails after the
+      # confirmation update; that update must roll back with it (no side effect commits
+      # without the durable context row).
+      Repo.insert!(%BlockProcessContext{id: "other-160", height: 160, processed_at: now()})
+
+      assert {:error, {:context_insert_failed, _}} =
+               BlockProcessor.record_block(block_hash_hex, 160, [txid_hex])
+
+      refute Repo.get(MetaTransaction, meta.id).is_confirmed
+    end
+
+    test "a fresh block records its context and returns {:ok, height}" do
+      assert {:ok, 170} = BlockProcessor.record_block("block-170", 170, [])
+      assert Repo.get(BlockProcessContext, "block-170").height == 170
     end
   end
 

@@ -223,27 +223,10 @@ defmodule Athanor.Indexer.BlockProcessor do
          # configured bootstrap boundary (§5). Everything else is refused so a child
          # is never recorded over a gap.
          :ok <- predecessor_status(prev_hash, height, block_hash: block_hash_hex) do
-      # Process each transaction in the block
-      txids = block["tx"] || []
-
-      Enum.each(txids, fn tx_data ->
-        process_block_tx(tx_data, height, block_hash_hex)
-      end)
-
-      # Confirm any unconfirmed txs that are in this block
-      confirm_block_txs(txids, height, block_hash_hex)
-
-      # Record block as processed
-      %BlockProcessContext{}
-      |> BlockProcessContext.changeset(%{
-        id: block_hash_hex,
-        height: height,
-        processed_at: DateTime.utc_now()
-      })
-      |> Repo.insert(on_conflict: :nothing)
-
-      Logger.info("Processed block #{height} (#{block_hash_hex})")
-      {:ok, height}
+      # Process the block's txs, confirm them, and record the durable context — all in
+      # ONE transaction (note-1057), returning {:ok, height} only once the context row
+      # is durably present; a failed context insert returns {:error, reason}.
+      record_block(block_hash_hex, height, block["tx"] || [])
     else
       {:error, :missing_predecessor} = err ->
         Logger.warning(
@@ -255,6 +238,62 @@ defmodule Athanor.Indexer.BlockProcessor do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # Records a connected block ATOMICALLY (Phase 7 F7.2 T7.1, tightened per Hermes !20
+  # note-1057): in ONE `Repo.transaction`, processes the block's transactions, confirms
+  # them, and inserts the durable `block_process_contexts` row. The context insert
+  # result is CHECKED — a failure (e.g. the unique-`height` constraint, or a changeset
+  # error) rolls the per-block side effects back and returns
+  # `{:error, {:context_insert_failed, _}}`, so `connect_branch/3` halts at this block
+  # and `TipController` defers rather than treating the height as durably applied.
+  # Returns `{:ok, height}` only once the context row is committed.
+  #
+  # `@doc false` — an internal step of `apply_branch/2` (whose `predecessor_status/3`
+  # gate runs first); exposed for direct unit testing, like `connect_branch/3` and
+  # `predecessor_status/3`. It is a plain function (no externally-reachable message), so
+  # it does not reintroduce a mutation path that bypasses the ordered op (note-1035).
+  @doc false
+  @spec record_block(String.t(), non_neg_integer(), [map() | binary()]) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def record_block(block_hash_hex, height, txids) do
+    result =
+      Repo.transaction(fn ->
+        Enum.each(txids, fn tx_data -> process_block_tx(tx_data, height, block_hash_hex) end)
+        confirm_block_txs(txids, height, block_hash_hex)
+
+        case insert_block_context(block_hash_hex, height) do
+          {:ok, _row} -> :recorded
+          {:error, changeset} -> Repo.rollback({:context_insert_failed, changeset})
+        end
+      end)
+
+    case result do
+      {:ok, :recorded} ->
+        Logger.info("Processed block #{height} (#{block_hash_hex})")
+        {:ok, height}
+
+      {:error, reason} ->
+        Logger.warning(
+          "BlockProcessor: block #{block_hash_hex} not recorded (#{inspect(reason)}) — fail closed"
+        )
+
+        {:error, reason}
+    end
+  end
+
+  # Inserts the durable per-block context row, returning the `Repo.insert` result so
+  # the enclosing transaction can roll back (and the caller fail closed) on any error.
+  # No `on_conflict: :nothing`: a same-`height` (or duplicate-id) conflict is a real
+  # error here — the block was not durably recorded and must not be reported applied.
+  defp insert_block_context(block_hash_hex, height) do
+    %BlockProcessContext{}
+    |> BlockProcessContext.changeset(%{
+      id: block_hash_hex,
+      height: height,
+      processed_at: DateTime.utc_now()
+    })
+    |> Repo.insert()
   end
 
   defp process_block_tx(tx_data, _height, _block_hash_hex) when is_map(tx_data) do
