@@ -12,7 +12,8 @@ defmodule Athanor.P2P.SourceRouter do
 
   ## Capabilities & providers
     * capabilities — `:raw_tx_fetch | :broadcast | :realtime_ingest |
-      :validation_fetch | :block_backfill | :historical_scan | :balance_utxo_fetch`.
+      :validation_fetch | :block_backfill | :historical_scan | :balance_utxo_fetch |
+      :chain_tip`.
     * providers — `:p2p | :rpc | :whatsonchain | :bitails | :junglebus | :zmq`.
 
   ## Default route table (the honesty contract)
@@ -31,6 +32,11 @@ defmodule Athanor.P2P.SourceRouter do
       block_backfill      :rpc           [:junglebus]
       historical_scan     :whatsonchain  []
       balance_utxo_fetch  :whatsonchain  [:bitails]
+      chain_tip           :p2p           [:rpc]
+
+  `:chain_tip` (Phase 6 §C) is P2P-primary: when peers are live the `HeadersChain`
+  drives tip/reorg decisions and the RPC `ChainTipVerifier` poll defers to it;
+  with no peers it falls back to the RPC poll, which stays the authority.
 
   Override per capability with
   `config :athanor, Athanor.P2P.SourceRouter, routes: %{capability => {primary, fallbacks}}`;
@@ -46,6 +52,7 @@ defmodule Athanor.P2P.SourceRouter do
           | :block_backfill
           | :historical_scan
           | :balance_utxo_fetch
+          | :chain_tip
   @type route :: {provider(), [provider()]}
 
   # The single source of truth for default routing — mirrors the moduledoc table.
@@ -56,7 +63,8 @@ defmodule Athanor.P2P.SourceRouter do
     validation_fetch: {:rpc, []},
     block_backfill: {:rpc, [:junglebus]},
     historical_scan: {:whatsonchain, []},
-    balance_utxo_fetch: {:whatsonchain, [:bitails]}
+    balance_utxo_fetch: {:whatsonchain, [:bitails]},
+    chain_tip: {:p2p, [:rpc]}
   }
 
   @doc """

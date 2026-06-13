@@ -87,7 +87,7 @@ defmodule Athanor.P2P.Supervisor do
 
     headers_opts =
       opts
-      |> Keyword.get(:headers_opts, [])
+      |> Keyword.get(:headers_opts, default_headers_opts())
       |> Keyword.put_new(:name, HeadersChain)
 
     # `:rest_for_one`, ordered Registry → Observer → TxRelay → TxFetcher →
@@ -136,6 +136,32 @@ defmodule Athanor.P2P.Supervisor do
   # lifecycle events back to the `broadcasts` audit rows (§C); target selection
   # and TTL/cap use their production defaults.
   defp default_relay_opts, do: [audit: &Broadcast.apply_relay_event/1]
+
+  # HeadersChain options for the supervised child (Phase 6 §C). The synthetic root
+  # is seeded from the node's current best block over RPC, and tip events are
+  # bridged onto the index via the `ChainTipVerifier`. Window/PoW/tick use their
+  # production defaults.
+  defp default_headers_opts do
+    [
+      seed: &rpc_seed/0,
+      on_tip: &Athanor.Workers.ChainTipVerifier.apply_tip_event/1
+    ]
+  end
+
+  # Seed the header tree from the node's current best block via RPC. Returns
+  # `{:ok, height, wire_hash}` — the hash is converted display→wire order to match
+  # how header `prev_block`/`hash` bytes arrive on the P2P wire. Any RPC/decoding
+  # failure returns `{:error, _}`; the chain then starts inert and retries on tick
+  # (a failed seed never crashes the supervisor).
+  defp rpc_seed do
+    with {:ok, height} <- Athanor.Blockchain.RpcClient.get_block_count(),
+         {:ok, hash_hex} <- Athanor.Blockchain.RpcClient.get_block_hash(height),
+         {:ok, display} <- Base.decode16(hash_hex, case: :mixed) do
+      {:ok, height, Athanor.P2P.Codec.Hash.display_to_wire(display)}
+    else
+      other -> {:error, other}
+    end
+  end
 
   # Seed a `Watchlist` from the watched-address table. Wrapped defensively: a
   # transient DB unavailability at P2P start (P2P is enabled post-boot) must not
