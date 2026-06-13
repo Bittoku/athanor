@@ -11,7 +11,7 @@ defmodule Athanor.Indexer.BlockProcessor do
   require Logger
 
   alias Athanor.Repo
-  alias Athanor.Schema.{BlockProcessContext, MetaTransaction, Utxo}
+  alias Athanor.Schema.{AddressHistory, BlockProcessContext, MetaTransaction, Utxo}
   alias Athanor.Blockchain.RpcClient
   alias Athanor.Indexer.{Bootstrap, TransactionFilter, TransactionProcessor}
   import Ecto.Query
@@ -418,6 +418,14 @@ defmodule Athanor.Indexer.BlockProcessor do
           |> where([u], u.txid == ^txid_binary)
           |> Repo.update_all(set: [block_height: height])
 
+          # Confirm address-history rows (note-1073): they are keyed by the hex txid and
+          # are written with `block_height: nil` at first index (mempool or inline block
+          # indexing), so tie them to the applied block here — same confirm contract as
+          # MetaTransactions/UTXOs.
+          AddressHistory
+          |> where([h], h.txid == ^txid_hex)
+          |> Repo.update_all(set: [block_height: height])
+
         :error ->
           :ok
       end
@@ -551,6 +559,13 @@ defmodule Athanor.Indexer.BlockProcessor do
     # Unconfirm UTXOs above this height
     Utxo
     |> where([u], u.block_height > ^height)
+    |> Repo.update_all(set: [block_height: nil])
+
+    # Demote address-history rows above this height (note-1073) — keep them in the same
+    # reorg contract as MetaTransactions/UTXOs so an orphaned block's history entries
+    # are no longer indistinguishable from confirmed ones.
+    AddressHistory
+    |> where([h], h.block_height > ^height)
     |> Repo.update_all(set: [block_height: nil])
 
     :ok

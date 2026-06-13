@@ -413,5 +413,34 @@ defmodule Athanor.Indexer.BlockProcessorApplyBranchTest do
     end
   end
 
+  describe "address-history confirmation + reorg demotion (note-1073)" do
+    test "an applied block tx's address history carries the block height and is demoted on rollback" do
+      pkh = :binary.copy(<<0x58>>, 20)
+      address = BSV.Base58.check_encode(pkh, 0x00)
+      tx = p2pkh_tx(pkh)
+      txid_hex = BSV.Transaction.tx_id_hex(tx)
+      block_hash_hex = String.duplicate("cd", 32)
+
+      # Index the matched tx inline (writes AddressHistory with block_height: nil), then
+      # record_block must confirm the history to the applied block height (400).
+      index_fun = fn _t, _h, _bh ->
+        case TransactionProcessor.index_tx(tx, [address], [], :block) do
+          {:ok, _} -> :ok
+          err -> err
+        end
+      end
+
+      assert {:ok, 400} =
+               BlockProcessor.record_block(block_hash_hex, 400, [txid_hex], index_fun: index_fun)
+
+      assert Repo.get_by(AddressHistory, txid: txid_hex).block_height == 400
+
+      # Roll back past the block → the history row is demoted in the same transaction as
+      # the MetaTransaction/UTXO/context reverts (no orphaned confirmed history).
+      assert :ok = BlockProcessor.rollback_to(399)
+      assert Repo.get_by(AddressHistory, txid: txid_hex).block_height == nil
+    end
+  end
+
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:second)
 end
