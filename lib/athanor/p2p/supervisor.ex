@@ -137,33 +137,20 @@ defmodule Athanor.P2P.Supervisor do
   # and TTL/cap use their production defaults.
   defp default_relay_opts, do: [audit: &Broadcast.apply_relay_event/1]
 
-  # HeadersChain options for the supervised child (Phase 6 §C). The synthetic root
-  # is seeded from the node's current best block over RPC, and the header PoW gate
-  # is bound to the active network's consensus pow-limit. Window/tick use their
-  # defaults.
+  # HeadersChain options for the supervised child. The synthetic root is seeded from
+  # the node's current best block over RPC, and the header PoW gate is bound to the
+  # active network's consensus pow-limit. Window/tick use their defaults.
   #
-  # Phase 6 ships the headers chain as **reorg detection only**: tip events are
-  # logged (operator visibility), not yet bridged onto the index. Driving the index
-  # from these events — the RPC↔P2P tip-authority handoff, no-gap recovery, and the
-  # bootstrap boundary — is the Phase 7 follow-up (docs/thin-node-p2p-phase7-followups.md
-  # F7.2); until then the existing RPC `ChainTipVerifier` poll remains the sole tip
-  # authority for the index.
+  # Phase 7 F7.2: the chain's tip events are an advisory **hint** to the single
+  # index-tip mutation owner (`Athanor.Indexer.TipController.notify_tip/1`). The
+  # chain's low-latency reorg detection thus *accelerates* the RPC-confirmed
+  # reconcile without granting P2P any index-mutation authority.
   defp default_headers_opts(network) do
     [
       seed: &rpc_seed/0,
-      on_tip: &log_tip_event/1,
+      on_tip: &Athanor.Indexer.TipController.notify_tip/1,
       pow_limit: network.pow_limit
     ]
-  end
-
-  # Detection-only tip sink (Phase 6): surface the chain's tip decisions to the log
-  # without mutating the index. Phase 7 (F7.2) replaces this with the index bridge.
-  defp log_tip_event(event) do
-    Logger.info(
-      "HeadersChain tip event (detection-only; index integration is Phase 7): #{inspect(event)}"
-    )
-
-    :ok
   end
 
   # Seed the header tree from the node's current best block via RPC. Returns

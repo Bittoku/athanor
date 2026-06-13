@@ -17,9 +17,12 @@ defmodule Athanor.Workers.Supervisor do
 
   @impl true
   def init(_init_arg) do
+    # `Athanor.Workers.ChainTipVerifier` (the legacy RPC tip poller that cast
+    # straight into `BlockProcessor`) is retired in Phase 7 F7.2: its RPC poll +
+    # catch-up role is the `Athanor.Indexer.TipController` reconcile cycle — the
+    # single index-tip mutation owner — so it is no longer supervised.
     children = [
       Athanor.Workers.UnconfirmedMonitor,
-      Athanor.Workers.ChainTipVerifier,
       Athanor.Workers.StasObserver,
       Athanor.Workers.MissingTxSyncer
     ]

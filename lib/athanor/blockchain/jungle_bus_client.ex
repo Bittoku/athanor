@@ -174,13 +174,12 @@ defmodule Athanor.Blockchain.JungleBusClient do
         Enum.reduce(from..to, state, fn height, acc ->
           case do_get("#{state.url}/v1/block_header/get/#{height}") do
             {:ok, %{"hash" => hash}} ->
-              # Feed to BlockProcessor
+              # Phase 7 F7.2: a polled block is an advisory **hint** to the single
+              # index-tip mutation owner (`TipController`); it never mutates the
+              # index directly. The controller runs an RPC-confirmed reconcile.
               case Base.decode16(hash, case: :mixed) do
                 {:ok, hash_binary} ->
-                  GenServer.cast(
-                    Athanor.Indexer.BlockProcessor,
-                    {:process_block_hash, hash_binary}
-                  )
+                  Athanor.Indexer.TipController.hint(:junglebus, hash_binary)
 
                 :error ->
                   :ok
