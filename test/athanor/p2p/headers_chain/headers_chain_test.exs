@@ -197,6 +197,70 @@ defmodule Athanor.P2P.HeadersChainTest do
     assert_receive {:tip, {:reorg_too_deep, _}}
   end
 
+  test "detached tracking is scoped per peer: one detached batch from each of two peers does not escalate" do
+    setup_registry()
+    {p1, _s1} = ready_peer()
+    {p2, _s2} = ready_peer()
+    register(p1, 1)
+    register(p2, 2)
+    hc = start_hc(max_detached_rounds: 2)
+
+    # A below-window fork (unknown parent) → detached. Sent once from each distinct
+    # peer; neither peer alone reaches the threshold, so no authority suspension.
+    detached = chain(:binary.copy(<<0x99>>, 32), 1)
+
+    send(hc, {:peer, p1, :frame, headers_frame(detached)})
+    _ = :sys.get_state(hc)
+    send(hc, {:peer, p2, :frame, headers_frame(detached)})
+    _ = :sys.get_state(hc)
+
+    refute_received {:tip, {:reorg_too_deep, _}}
+  end
+
+  test "a batch that advances the tip is never counted as a detached round (mixed batch)" do
+    setup_registry()
+    {peer, _sock} = ready_peer()
+    register(peer, 1)
+    hc = start_hc(max_detached_rounds: 2)
+
+    # One batch that BOTH extends the tip (off the seed) and carries a detached
+    # junk header (unknown parent). Progress must reset detached tracking.
+    [e1, e2] = chain(@seed, 2)
+    [junk] = chain(:binary.copy(<<0x99>>, 32), 1)
+    send(hc, {:peer, peer, :frame, headers_frame([e1, e2, junk])})
+    assert_receive {:tip, {:extend, _}}
+
+    # A second identical batch — still only one *new* detached round at most, so
+    # with the progress reset it never reaches max_detached_rounds.
+    send(hc, {:peer, peer, :frame, headers_frame([junk])})
+    _ = :sys.get_state(hc)
+    refute_received {:tip, {:reorg_too_deep, _}}
+  end
+
+  test "progress between detached batches resets the per-peer counter" do
+    setup_registry()
+    {peer, _sock} = ready_peer()
+    register(peer, 1)
+    hc = start_hc(max_detached_rounds: 2)
+
+    detached = chain(:binary.copy(<<0x99>>, 32), 1)
+
+    # Round 1 of detached.
+    send(hc, {:peer, peer, :frame, headers_frame(detached)})
+    _ = :sys.get_state(hc)
+    refute_received {:tip, {:reorg_too_deep, _}}
+
+    # A valid extend resets detached tracking.
+    [e1] = chain(@seed, 1)
+    send(hc, {:peer, peer, :frame, headers_frame([e1])})
+    assert_receive {:tip, {:extend, _}}
+
+    # The next detached is round 1 again, not 2 → no escalation at threshold 2.
+    send(hc, {:peer, peer, :frame, headers_frame(detached)})
+    _ = :sys.get_state(hc)
+    refute_received {:tip, {:reorg_too_deep, _}}
+  end
+
   test "a malformed headers body is dropped (no tip event)" do
     setup_registry()
     {peer, _sock} = ready_peer()

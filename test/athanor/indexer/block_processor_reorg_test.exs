@@ -151,6 +151,48 @@ defmodule Athanor.Indexer.BlockProcessorReorgTest do
     assert is_nil(Repo.get!(Utxo, t_output.id).block_height)
   end
 
+  test "apply_reorg(fork, []) advances last_height to the fork height after rollback (note 941 B3)" do
+    proc = start_supervised!(BlockProcessor)
+
+    {:ok, _} =
+      %BlockProcessContext{}
+      |> BlockProcessContext.changeset(%{
+        id: "block-101",
+        height: 101,
+        processed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      })
+      |> Repo.insert()
+
+    # Rollback to 100 with no canonical branch to connect (node at the ancestor).
+    :ok = BlockProcessor.apply_reorg(100, [])
+    _ = :sys.get_state(proc)
+
+    # The DB was rolled back; the GenServer must NOT still advertise the orphaned
+    # tip height — it reflects the fork height.
+    assert is_nil(Repo.get(BlockProcessContext, "block-101"))
+    assert BlockProcessor.last_processed_height() == 100
+  end
+
+  test "apply_reorg(fork, [failing_hash]) keeps last_height at the fork when the connect block fails (note 941 B3)" do
+    proc = start_supervised!(BlockProcessor)
+
+    {:ok, _} =
+      %BlockProcessContext{}
+      |> BlockProcessContext.changeset(%{
+        id: "block-101",
+        height: 101,
+        processed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      })
+      |> Repo.insert()
+
+    # The connect block can't be fetched (RPC stub errors), so it must not advance
+    # last_height past the fork — never leave it at the stale orphaned height.
+    :ok = BlockProcessor.apply_reorg(100, [:crypto.strong_rand_bytes(32)])
+    _ = :sys.get_state(proc)
+
+    assert BlockProcessor.last_processed_height() == 100
+  end
+
   test "rollback leaves a UTXO spent by a non-orphaned tx alone" do
     deep_txid = :crypto.strong_rand_bytes(32)
     spender_txid = :crypto.strong_rand_bytes(32)

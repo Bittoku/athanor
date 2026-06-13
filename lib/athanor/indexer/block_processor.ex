@@ -73,10 +73,19 @@ defmodule Athanor.Indexer.BlockProcessor do
   end
 
   def handle_cast({:apply_reorg, fork_height, connect_hashes}, state) do
-    if is_integer(fork_height) do
-      Logger.warning("BlockProcessor: P2P reorg — rolling back to height #{fork_height}")
-      rollback_to(fork_height)
-    end
+    # After a successful rollback, `last_height` MUST drop to the fork height before
+    # connecting the new branch — otherwise an empty/failed connect would leave the
+    # GenServer advertising the orphaned tip height while the DB is rolled back
+    # (Hermes !18 note 941 B3). Each connect block then advances it; a failing
+    # connect leaves it at the last successfully processed height.
+    state =
+      if is_integer(fork_height) do
+        Logger.warning("BlockProcessor: P2P reorg — rolling back to height #{fork_height}")
+        rollback_to(fork_height)
+        %{state | last_height: fork_height, processing: false}
+      else
+        state
+      end
 
     state =
       Enum.reduce(connect_hashes, state, fn hash, acc ->

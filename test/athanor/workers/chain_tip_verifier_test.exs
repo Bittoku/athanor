@@ -225,4 +225,92 @@ defmodule Athanor.Workers.ChainTipVerifierTest do
       refute_received {:"$gen_cast", {:apply_reorg, _, _}}
     end
   end
+
+  # Hermes !18 note 941: the RPC reconcile must positively prove the ancestor and
+  # never dispatch on missing/sparse hashes.
+  describe "reconcile robustness (note 941)" do
+    test "blocker 1: defers (no rollback) when a hash below the tip is unknown — ancestor not proven" do
+      # Tip hashes differ (looks like a reorg), but the node hash below the tip is
+      # unavailable (RPC pruned/transient) so the common ancestor can't be proven.
+      local = fn h -> %{5 => "B5", 4 => "B4", 3 => "AA"}[h] end
+      node = fn h -> %{5 => "C5"}[h] end
+
+      assert :defer =
+               ChainTipVerifier.reconcile(5, 5,
+                 local_hash_at: local,
+                 node_hash_at: node,
+                 processor: self(),
+                 batch: 10
+               )
+
+      refute_received {:"$gen_cast", {:apply_reorg, _, _}}
+      refute_received {:"$gen_cast", {:process_block_hash, _}}
+    end
+
+    test "blocker 1: a local hash gap below the tip also defers (no destructive rollback)" do
+      local = fn h -> %{5 => "B5"}[h] end
+      node = fn h -> %{5 => "C5", 4 => "C4", 3 => "AA"}[h] end
+
+      assert :defer =
+               ChainTipVerifier.reconcile(5, 5,
+                 local_hash_at: local,
+                 node_hash_at: node,
+                 processor: self(),
+                 batch: 10
+               )
+
+      refute_received {:"$gen_cast", {:apply_reorg, _, _}}
+    end
+
+    test "blocker 2: catch-up dispatches only the contiguous prefix, stopping at the first gap" do
+      local = fn h -> %{5 => "AA"}[h] end
+      # node tip 8 but height 7 is missing.
+      node = fn h -> %{5 => "AA", 6 => "C6", 8 => "C8"}[h] end
+
+      assert {:catch_up, 6, 8} =
+               ChainTipVerifier.reconcile(5, 8,
+                 local_hash_at: local,
+                 node_hash_at: node,
+                 processor: self(),
+                 batch: 10
+               )
+
+      c6 = Base.decode16!("C6")
+      assert_received {:"$gen_cast", {:process_block_hash, ^c6}}
+      # Neither the gap (7) nor anything after it is dispatched.
+      refute_received {:"$gen_cast", {:process_block_hash, _}}
+    end
+
+    test "blocker 2: catch-up defers entirely when the first canonical hash is missing" do
+      local = fn h -> %{5 => "AA"}[h] end
+      node = fn h -> %{5 => "AA", 7 => "C7"}[h] end
+
+      assert :defer =
+               ChainTipVerifier.reconcile(5, 7,
+                 local_hash_at: local,
+                 node_hash_at: node,
+                 processor: self(),
+                 batch: 10
+               )
+
+      refute_received {:"$gen_cast", {:process_block_hash, _}}
+    end
+
+    test "blocker 2: reorg connects only the contiguous canonical prefix from ancestor+1" do
+      local = fn h -> %{5 => "B5", 4 => "B4", 3 => "AA"}[h] end
+      # ancestor 3; node tip 8 with height 7 missing.
+      node = fn h -> %{5 => "C5", 4 => "C4", 3 => "AA", 6 => "C6", 8 => "C8"}[h] end
+
+      assert {:reorg, 3, 8} =
+               ChainTipVerifier.reconcile(5, 8,
+                 local_hash_at: local,
+                 node_hash_at: node,
+                 processor: self(),
+                 batch: 10
+               )
+
+      connect = Enum.map(["C4", "C5", "C6"], &Base.decode16!/1)
+      assert_received {:"$gen_cast", {:apply_reorg, 3, ^connect}}
+    end
+  end
 end

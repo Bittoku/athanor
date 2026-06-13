@@ -240,26 +240,14 @@ defmodule Athanor.Workers.ChainTipVerifier do
   end
 
   # Run a reconciliation cycle with RPC as the authority, then fold the outcome
-  # into the synced counter. Bails out (no change) if the node hash at the local
-  # tip can't be read this cycle, so a transient RPC hiccup never triggers a
-  # spurious deep rollback — it retries on the next tick.
-  defp rpc_reconcile(0, node_height, state) do
-    apply_reconcile_result(reconcile(0, node_height, default_reconcile_opts()), state)
-  end
-
+  # into the synced counter. The plan itself `:defer`s on any unproven ancestor or
+  # missing canonical hash, so a transient RPC hiccup / pruned hash never triggers
+  # a spurious rollback — it simply retries on the next tick.
   defp rpc_reconcile(local_height, node_height, state) do
-    case rpc_hash_at(min(local_height, node_height)) do
-      nil ->
-        Logger.warning("ChainTipVerifier: node hash unavailable this cycle; deferring reconcile")
-        state
-
-      _hash ->
-        apply_reconcile_result(
-          reconcile(local_height, node_height, default_reconcile_opts()),
-          state
-        )
-    end
+    apply_reconcile_result(reconcile(local_height, node_height, default_reconcile_opts()), state)
   end
+
+  defp apply_reconcile_result(:defer, state), do: state
 
   defp apply_reconcile_result(:synced, state),
     do: %{state | consecutive_synced: state.consecutive_synced + 1}
@@ -267,54 +255,68 @@ defmodule Athanor.Workers.ChainTipVerifier do
   defp apply_reconcile_result(_acted, state), do: %{state | consecutive_synced: 0}
 
   @doc """
-  Plans RPC-authority reconciliation by **hash** (Hermes !18 note 937). Walks down
-  from `min(local_height, node_height)` to the highest height where the local and
-  node hashes agree (the common ancestor), then:
+  Plans RPC-authority reconciliation by **hash** (Hermes !18 notes 937, 941). Walks
+  down from `min(local_height, node_height)` looking for the highest height where
+  the local and node hashes are both known **and** agree (the common ancestor):
 
     * `:synced` — heights equal and tips agree;
     * `{:catch_up, from, to}` — no divergence, the node is simply ahead;
     * `{:reorg, ancestor, to}` — the chains diverge: roll back to `ancestor` and
-      reprocess the canonical branch from `ancestor + 1` (so the canonical block at
-      the old local height is never skipped), up to `to`.
+      reprocess the canonical branch from `ancestor + 1` up to `to`;
+    * `:defer` — a local or node hash below the tip is **unknown**, so the ancestor
+      cannot be positively proven this cycle. Never reorg/rollback on an unproven
+      ancestor (a transient/pruned hash must not look like a real mismatch).
 
   `local_hash_at`/`node_hash_at` are `(height -> hash | nil)`. Pure.
   """
   @spec reconcile_plan(non_neg_integer(), non_neg_integer(), fun(), fun()) ::
           :synced
+          | :defer
           | {:catch_up, pos_integer(), non_neg_integer()}
           | {:reorg, non_neg_integer(), non_neg_integer()}
   def reconcile_plan(0, node_height, _local_hash_at, _node_hash_at),
     do: {:catch_up, 1, node_height}
 
   def reconcile_plan(local_height, node_height, local_hash_at, node_hash_at) do
-    ancestor = common_ancestor(min(local_height, node_height), local_hash_at, node_hash_at)
+    case find_ancestor(min(local_height, node_height), local_hash_at, node_hash_at) do
+      :defer ->
+        :defer
 
-    cond do
-      ancestor == local_height and local_height == node_height -> :synced
-      ancestor == local_height -> {:catch_up, local_height + 1, node_height}
-      true -> {:reorg, ancestor, node_height}
+      {:ok, ancestor} ->
+        cond do
+          ancestor == local_height and local_height == node_height -> :synced
+          ancestor == local_height -> {:catch_up, local_height + 1, node_height}
+          true -> {:reorg, ancestor, node_height}
+        end
     end
   end
 
-  # Highest height (≤ `h`) at which the local and node hashes agree; 0 (genesis) if
-  # they never do within the window walked.
-  defp common_ancestor(0, _local_hash_at, _node_hash_at), do: 0
+  # Highest height (≤ `h`) at which the local and node hashes are both known and
+  # equal. Returns `:defer` the moment either hash is unknown before a match is
+  # found — an unknown hash is NOT a mismatch, so we never walk past it into a
+  # destructive deep rollback without positively proving the ancestor.
+  defp find_ancestor(h, _local_hash_at, _node_hash_at) when h < 0, do: :defer
 
-  defp common_ancestor(h, local_hash_at, node_hash_at) do
+  defp find_ancestor(h, local_hash_at, node_hash_at) do
     lh = local_hash_at.(h)
+    nh = node_hash_at.(h)
 
-    if not is_nil(lh) and lh == node_hash_at.(h),
-      do: h,
-      else: common_ancestor(h - 1, local_hash_at, node_hash_at)
+    cond do
+      is_nil(lh) or is_nil(nh) -> :defer
+      lh == nh -> {:ok, h}
+      true -> find_ancestor(h - 1, local_hash_at, node_hash_at)
+    end
   end
 
   @doc """
   Executes a `reconcile_plan/4` against the node, dispatching the recovery to
   `BlockProcessor`. A `{:reorg, …}` is a single ordered `apply_reorg/3` op
-  (rollback + canonical branch from `ancestor + 1`); a `{:catch_up, …}` enqueues a
-  bounded forward batch. Returns the plan that was executed. `opts`:
-  `:local_hash_at`, `:node_hash_at` (`(height -> hash | nil)`), `:processor`,
-  `:batch` (max blocks dispatched per cycle, default 10).
+  (rollback + the **contiguous** canonical prefix from `ancestor + 1`); a
+  `{:catch_up, …}` enqueues the contiguous forward prefix. Stopping at the first
+  missing/invalid hash (rather than skipping it) guarantees no gap is recorded —
+  the cycle `:defer`s if the required first block is unavailable. Returns the plan
+  executed, or `:defer`. `opts`: `:local_hash_at`, `:node_hash_at`
+  (`(height -> hash | nil)`), `:processor`, `:batch` (max blocks/cycle, default 10).
   """
   @spec reconcile(non_neg_integer(), non_neg_integer(), keyword()) :: term()
   def reconcile(local_height, node_height, opts) do
@@ -324,32 +326,66 @@ defmodule Athanor.Workers.ChainTipVerifier do
     batch = Keyword.get(opts, :batch, 10)
 
     case reconcile_plan(local_height, node_height, local_hash_at, node_hash_at) do
+      :defer ->
+        :defer
+
       :synced ->
         :synced
 
       {:catch_up, from, to} = plan ->
-        Enum.each(branch_hashes(from, to, node_hash_at, batch), fn hash ->
-          GenServer.cast(processor, {:process_block_hash, hash})
-        end)
+        case branch_hashes(from, to, node_hash_at, batch) do
+          # The first canonical block is unavailable — defer rather than record a gap.
+          [] ->
+            :defer
 
-        plan
+          hashes ->
+            Enum.each(hashes, &GenServer.cast(processor, {:process_block_hash, &1}))
+            plan
+        end
 
       {:reorg, ancestor, to} = plan ->
-        connect = branch_hashes(ancestor + 1, to, node_hash_at, batch)
+        do_reorg(processor, ancestor, to, node_hash_at, batch, plan)
+    end
+  end
+
+  # `to <= ancestor`: the node is at/below the common ancestor — the local tip is an
+  # orphan fork above it. Roll back to the ancestor; there is no canonical branch to
+  # connect. Otherwise require the canonical block at `ancestor + 1` to be available
+  # (a contiguous prefix) before rolling back, so we never roll back into a gap.
+  defp do_reorg(processor, ancestor, to, _node_hash_at, _batch, plan) when to <= ancestor do
+    BlockProcessor.apply_reorg(processor, ancestor, [])
+    plan
+  end
+
+  defp do_reorg(processor, ancestor, to, node_hash_at, batch, plan) do
+    case branch_hashes(ancestor + 1, to, node_hash_at, batch) do
+      [] ->
+        :defer
+
+      connect ->
         BlockProcessor.apply_reorg(processor, ancestor, connect)
         plan
     end
   end
 
-  # Decoded node block-hash binaries for `from..to`, capped to `batch` blocks per
-  # cycle (the remainder is picked up by later ticks). Malformed/missing hashes are
-  # skipped (logged), so a single bad height can't abort the batch.
+  # The **contiguous** decoded node block-hash prefix for `from..to`, capped to
+  # `batch` blocks per cycle. Stops at the first missing/invalid hash (returning the
+  # prefix only) so a gap is never silently bridged — the remainder is picked up by
+  # later ticks once the node has it.
   defp branch_hashes(from, to, _node_hash_at, _batch) when from > to, do: []
 
   defp branch_hashes(from, to, node_hash_at, batch) do
-    last = min(from + batch - 1, to)
+    contiguous_hashes(from, min(from + batch - 1, to), node_hash_at, [])
+  end
 
-    for height <- from..last, hash = decode_hash(node_hash_at.(height)), hash != nil, do: hash
+  defp contiguous_hashes(height, last, _node_hash_at, acc) when height > last,
+    do: Enum.reverse(acc)
+
+  defp contiguous_hashes(height, last, node_hash_at, acc) do
+    case decode_hash(node_hash_at.(height)) do
+      nil -> Enum.reverse(acc)
+      hash -> contiguous_hashes(height + 1, last, node_hash_at, [hash | acc])
+    end
   end
 
   defp decode_hash(nil), do: nil

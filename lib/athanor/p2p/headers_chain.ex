@@ -74,6 +74,7 @@ defmodule Athanor.P2P.HeadersChain do
       max_detached_rounds: Keyword.get(opts, :max_detached_rounds, 3),
       tree_opts: build_tree_opts(opts),
       detached_rounds: 0,
+      detached_peer: nil,
       last_getheaders: %{}
     }
 
@@ -127,37 +128,59 @@ defmodule Athanor.P2P.HeadersChain do
   ## ── Tip-event handling ──
 
   defp apply_events(events, source_pid, state) do
-    Enum.reduce(events, state, fn event, st -> apply_event(event, source_pid, st) end)
+    # A batch that advanced the best tip is *progress* — a `{:detached, …}` carried
+    # in the same batch (junk headers riding alongside real ones) must NOT count
+    # against the deep-reorg counter (Hermes !18 note 941). Tip events also reset
+    # the per-peer detached tracking entirely.
+    progressed? =
+      Enum.any?(events, &match?({:extend, _}, &1)) or Enum.any?(events, &match?({:reorg, _}, &1))
+
+    Enum.reduce(events, state, fn event, st -> apply_event(event, source_pid, progressed?, st) end)
   end
 
-  defp apply_event({:extend, hashes}, _source, state) do
+  defp apply_event({:extend, hashes}, _source, _progressed?, state) do
     notify_tip(state, {:extend, display(hashes)})
-    %{state | detached_rounds: 0}
+    reset_detached(state)
   end
 
-  defp apply_event({:reorg, %{orphan: orphan, connect: connect}}, _source, state) do
+  defp apply_event({:reorg, %{orphan: orphan, connect: connect}}, _source, _progressed?, state) do
     notify_tip(state, {:reorg, %{orphan: display(orphan), connect: display(connect)}})
-    %{state | detached_rounds: 0}
+    reset_detached(state)
   end
 
-  defp apply_event({:detached, _count}, source_pid, state) do
-    rounds = state.detached_rounds + 1
+  # Detached headers in a batch that also advanced the tip are ignored — progress
+  # proves the chain is bridgeable, so this is not an unbridgeable-fork signal.
+  defp apply_event({:detached, _count}, _source, true, state), do: state
+
+  # Detached with no progress. The round counter is **scoped to a single peer**: a
+  # detached run only escalates when the *same* peer keeps failing to bridge across
+  # consecutive rounds, so junk from assorted peers can never accumulate to suspend
+  # P2P authority (Hermes !18 note 941). A new peer restarts the count at 1.
+  defp apply_event({:detached, _count}, source_pid, false, state) do
+    rounds = if state.detached_peer == source_pid, do: state.detached_rounds + 1, else: 1
 
     if rounds >= state.max_detached_rounds do
-      # The fork is deeper than the retained window: our locator can't bridge it.
+      # The same peer's fork is deeper than our retained window: locator can't bridge it.
       Logger.warning(
-        "HeadersChain: #{rounds} detached rounds — escalating to deep-reorg fallback"
+        "HeadersChain: #{rounds} detached rounds from #{inspect(source_pid)} — escalating to deep-reorg fallback"
       )
 
-      notify_tip(state, {:reorg_too_deep, %{rounds: rounds}})
-      %{state | detached_rounds: 0}
+      notify_tip(state, {:reorg_too_deep, %{rounds: rounds, peer: inspect(source_pid)}})
+      reset_detached(state)
     else
-      # Re-request from the peer that sent the detached run (it has the chain).
-      %{send_getheaders(state, source_pid, true) | detached_rounds: rounds}
+      # Re-request from that peer (it claims to have the chain), tracking it as the
+      # current fork candidate.
+      %{
+        send_getheaders(state, source_pid, true)
+        | detached_rounds: rounds,
+          detached_peer: source_pid
+      }
     end
   end
 
-  defp apply_event(_event, _source, state), do: state
+  defp apply_event(_event, _source, _progressed?, state), do: state
+
+  defp reset_detached(state), do: %{state | detached_rounds: 0, detached_peer: nil}
 
   ## ── getheaders ──
 
