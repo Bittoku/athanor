@@ -26,6 +26,29 @@ defmodule Athanor.Indexer.BlockProcessor do
     GenServer.call(__MODULE__, :last_processed_height)
   end
 
+  @doc """
+  Applies a P2P reorg as a **single ordered mailbox operation**: roll the index
+  back to `fork_height` (skipped when `nil` — no recorded common ancestor), then
+  process the new branch `connect_hashes` (display-order block-hash binaries,
+  ancestor→tip) in order.
+
+  Routing rollback + new-branch enqueue through this one cast serializes them
+  behind any already-queued `process_block_hash` work, so a rollback can never
+  interleave with in-flight block writes (Phase 6 §C; Hermes !18 note 932).
+
+  ## Parameters
+    - `server` — the BlockProcessor (defaults to the registered name).
+    - `fork_height` — common-ancestor height to roll back to, or `nil` to skip.
+    - `connect_hashes` — new-branch block hashes (display order) to process.
+
+  ## Returns
+    `:ok` (cast).
+  """
+  @spec apply_reorg(GenServer.server(), non_neg_integer() | nil, [binary()]) :: :ok
+  def apply_reorg(server \\ __MODULE__, fork_height, connect_hashes) do
+    GenServer.cast(server, {:apply_reorg, fork_height, connect_hashes})
+  end
+
   ## ── Server Callbacks ──
 
   @impl true
@@ -47,6 +70,29 @@ defmodule Athanor.Indexer.BlockProcessor do
         Logger.error("BlockProcessor failed: #{inspect(reason)}")
         {:noreply, %{state | processing: false}}
     end
+  end
+
+  def handle_cast({:apply_reorg, fork_height, connect_hashes}, state) do
+    if is_integer(fork_height) do
+      Logger.warning("BlockProcessor: P2P reorg — rolling back to height #{fork_height}")
+      rollback_to(fork_height)
+    end
+
+    state =
+      Enum.reduce(connect_hashes, state, fn hash, acc ->
+        hex = Base.encode16(hash, case: :lower)
+
+        case process_block(hex, acc) do
+          {:ok, height} ->
+            %{acc | last_height: height, processing: false}
+
+          {:error, reason} ->
+            Logger.error("BlockProcessor: reorg connect block #{hex} failed: #{inspect(reason)}")
+            %{acc | processing: false}
+        end
+      end)
+
+    {:noreply, state}
   end
 
   @impl true

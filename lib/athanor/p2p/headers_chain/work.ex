@@ -25,6 +25,14 @@ defmodule Athanor.P2P.HeadersChain.Work do
   trust floor that makes cumulative-work comparison safe against cheap forgery: a
   header whose hash does not meet its own claimed target is rejected by the tree.
 
+  `valid_pow?/3` adds the **consensus pow-limit gate**: a header is only credited
+  if its claimed `target` is at or below the network's maximum target (`bits` is
+  at least minimum difficulty) *and* its hash meets that target. Without the limit
+  a peer could advertise an easier-than-consensus `bits` (a huge but
+  non-overflowing target) that a real node would reject, and drive the
+  P2P-primary tip/reorg machinery — so for the production chain the pow-limit
+  check must fail closed at the header-validation boundary.
+
   Pure (no IO).
   """
 
@@ -79,6 +87,26 @@ defmodule Athanor.P2P.HeadersChain.Work do
     case compact_to_target(compact) do
       {:ok, target} -> :binary.decode_unsigned(hash, :little) <= target
       :error -> false
+    end
+  end
+
+  @doc """
+  Consensus proof-of-work check for a header: the claimed target (from `compact`)
+  must be at or below the network pow-limit (`limit_compact`), and the
+  wire/internal-order `hash` must meet that target.
+
+  Returns `false` for an over-limit (easier-than-consensus) target, a hash that
+  does not meet its target, or a malformed compact — a header is never credited on
+  a `bits` an actual node would reject.
+  """
+  @spec valid_pow?(<<_::256>>, compact(), compact()) :: boolean()
+  def valid_pow?(<<_::binary-32>> = hash, compact, limit_compact) do
+    with {:ok, target} <- compact_to_target(compact),
+         {:ok, limit} <- compact_to_target(limit_compact),
+         true <- target <= limit do
+      :binary.decode_unsigned(hash, :little) <= target
+    else
+      _ -> false
     end
   end
 

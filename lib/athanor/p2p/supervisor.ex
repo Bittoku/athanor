@@ -87,7 +87,7 @@ defmodule Athanor.P2P.Supervisor do
 
     headers_opts =
       opts
-      |> Keyword.get(:headers_opts, default_headers_opts())
+      |> Keyword.get(:headers_opts, default_headers_opts(pool_config.network))
       |> Keyword.put_new(:name, HeadersChain)
 
     # `:rest_for_one`, ordered Registry → Observer → TxRelay → TxFetcher →
@@ -138,13 +138,14 @@ defmodule Athanor.P2P.Supervisor do
   defp default_relay_opts, do: [audit: &Broadcast.apply_relay_event/1]
 
   # HeadersChain options for the supervised child (Phase 6 §C). The synthetic root
-  # is seeded from the node's current best block over RPC, and tip events are
-  # bridged onto the index via the `ChainTipVerifier`. Window/PoW/tick use their
-  # production defaults.
-  defp default_headers_opts do
+  # is seeded from the node's current best block over RPC, tip events are bridged
+  # onto the index via the `ChainTipVerifier`, and the header PoW gate is bound to
+  # the active network's consensus pow-limit. Window/tick use their defaults.
+  defp default_headers_opts(network) do
     [
       seed: &rpc_seed/0,
-      on_tip: &Athanor.Workers.ChainTipVerifier.apply_tip_event/1
+      on_tip: &Athanor.Workers.ChainTipVerifier.apply_tip_event/1,
+      pow_limit: network.pow_limit
     ]
   end
 

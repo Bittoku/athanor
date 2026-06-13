@@ -15,6 +15,10 @@ defmodule Athanor.P2P.Network do
     * `:dns_seeds`      — DNS seeder hostnames (primary bootstrap)
     * `:fallback_seeds` — hardcoded `{ip, port}` seeds; empty for now (the
       `pnSeed6_main` / `pnSeed6_test` IP tables are loaded in Phase 2 discovery)
+    * `:pow_limit` — the consensus maximum target as a compact `nBits` value
+      (bitcoin-sv `consensus.powLimit`). Both mainnet and Testnet3 use
+      `0x1d00ffff`. Header PoW validation rejects any `bits` whose target exceeds
+      this (an easier-than-consensus difficulty a real node would reject).
 
   ## Known gap — STN
   bitcoin-sv also defines the Scaling Test Network (magic `fb ce c4 f9`, port
@@ -26,14 +30,15 @@ defmodule Athanor.P2P.Network do
   """
 
   @enforce_keys [:name, :magic, :default_port, :dns_seeds, :fallback_seeds]
-  defstruct [:name, :magic, :default_port, :dns_seeds, :fallback_seeds]
+  defstruct [:name, :magic, :default_port, :dns_seeds, :fallback_seeds, pow_limit: 0x1D00FFFF]
 
   @type t :: %__MODULE__{
           name: :mainnet | :testnet,
           magic: <<_::32>>,
           default_port: :inet.port_number(),
           dns_seeds: [String.t()],
-          fallback_seeds: [{:inet.ip_address(), :inet.port_number()}]
+          fallback_seeds: [{:inet.ip_address(), :inet.port_number()}],
+          pow_limit: 0..0xFFFFFFFF
         }
 
   # atom -> wire command string. is_map_key/2 guards make an unknown command

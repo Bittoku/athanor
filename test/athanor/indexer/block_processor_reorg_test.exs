@@ -115,6 +115,42 @@ defmodule Athanor.Indexer.BlockProcessorReorgTest do
     assert is_nil(Repo.get(BlockProcessContext, "block-101"))
   end
 
+  test "apply_reorg/3 rolls back through the mailbox, after queued block work (serialized)" do
+    # Blocker 3 (Hermes !18 note 932): the P2P reorg must not run rollback in the
+    # caller while old-branch block casts are queued/in-flight. Routed as a single
+    # `{:apply_reorg, fork, connect}` cast, rollback is serialized behind any
+    # already-queued `process_block_hash` work in the BlockProcessor mailbox.
+    proc = start_supervised!(BlockProcessor)
+
+    transfer_txid = :crypto.strong_rand_bytes(32)
+    meta_fixture(transfer_txid, 101)
+    t_output = utxo_fixture(%{txid: transfer_txid, vout: 0, block_height: 101})
+
+    {:ok, _} =
+      %BlockProcessContext{}
+      |> BlockProcessContext.changeset(%{
+        id: "block-101",
+        height: 101,
+        processed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      })
+      |> Repo.insert()
+
+    # Queue a stale old-branch block first (RPC is down in test → it is a no-op),
+    # THEN the reorg. FIFO ordering means the reorg's rollback runs after the
+    # queued cast — never concurrently with it.
+    GenServer.cast(proc, {:process_block_hash, :crypto.strong_rand_bytes(32)})
+    :ok = BlockProcessor.apply_reorg(100, [])
+    # Drain the mailbox: the stale cast, then apply_reorg.
+    _ = :sys.get_state(proc)
+
+    # Block 101 was orphaned by the rollback embedded in the reorg op.
+    assert is_nil(Repo.get(BlockProcessContext, "block-101"))
+    demoted = Repo.get_by!(MetaTransaction, txid: transfer_txid)
+    assert demoted.is_confirmed == false
+    assert is_nil(demoted.block_height)
+    assert is_nil(Repo.get!(Utxo, t_output.id).block_height)
+  end
+
   test "rollback leaves a UTXO spent by a non-orphaned tx alone" do
     deep_txid = :crypto.strong_rand_bytes(32)
     spender_txid = :crypto.strong_rand_bytes(32)

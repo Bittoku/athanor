@@ -9,7 +9,11 @@ defmodule Athanor.P2P.HeadersChain.WorkTest do
   """
   use ExUnit.Case, async: true
 
+  alias Athanor.P2P.Codec.Hash
   alias Athanor.P2P.HeadersChain.Work
+
+  # mainnet/testnet consensus pow-limit (max target) compact.
+  @pow_limit 0x1D00FFFF
 
   test "genesis bits 0x1d00ffff decode to the known target and work" do
     assert {:ok, target} = Work.compact_to_target(0x1D00FFFF)
@@ -46,5 +50,33 @@ defmodule Athanor.P2P.HeadersChain.WorkTest do
 
   test "meets_target? is false for a malformed compact (never trusts it)" do
     refute Work.meets_target?(:binary.copy(<<0>>, 32), 0x01800000)
+  end
+
+  describe "valid_pow?/3 (consensus pow-limit + target gate)" do
+    test "rejects an over-limit (easier-than-consensus) target even when the hash meets it" do
+      # 0x207fffff (regtest-easy) decodes to a target far above the network
+      # pow-limit; a peer must not credit work for it on mainnet/testnet.
+      assert Work.meets_target?(:binary.copy(<<0>>, 32), 0x207FFFFF)
+      refute Work.valid_pow?(:binary.copy(<<0>>, 32), 0x207FFFFF, @pow_limit)
+    end
+
+    test "accepts the testnet genesis header (within limit, hash meets target)" do
+      {:ok, display} =
+        Base.decode16("000000000933EA01AD0EE984209779BAAEC3CED90FA3F408719526F8D77F4943",
+          case: :mixed
+        )
+
+      wire = Hash.display_to_wire(display)
+      assert Work.valid_pow?(wire, @pow_limit, @pow_limit)
+    end
+
+    test "rejects a within-limit target the hash does NOT meet" do
+      refute Work.valid_pow?(:binary.copy(<<0xFF>>, 32), @pow_limit, @pow_limit)
+    end
+
+    test "rejects a malformed compact regardless of the limit" do
+      refute Work.valid_pow?(:binary.copy(<<0>>, 32), 0x00000000, @pow_limit)
+      refute Work.valid_pow?(:binary.copy(<<0>>, 32), 0x01800000, @pow_limit)
+    end
   end
 end

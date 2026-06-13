@@ -194,30 +194,49 @@ defmodule Athanor.P2P.HeadersChain.Tree do
 
   ## ── locator ──
 
-  # Exponential step-back from tip (1,1,2,4,8,…) plus root, bounded to `n` hashes.
+  # Bitcoin-style block locator: the tip, then step back by 1 for the first ten
+  # hashes and **double the stride** thereafter (1,1,…,2,4,8,…), always ending at
+  # `root`, capped to `n` hashes total (including root). The exponential step-back
+  # lets a peer find the fork point in O(log height) even for a deep chain.
   defp locator(tree, n) do
-    acc = collect_locator(tree, tree.tip, 1, 1, [], n)
-    root = tree.root
-    locator = Enum.reverse(acc)
-    if List.last(locator) == root, do: locator, else: locator ++ [root]
+    collect_locator(tree, tree.tip, 1, 0, [], n)
+    |> Enum.reverse()
+    |> ensure_root_last(tree.root)
+    |> cap_with_root(n)
   end
 
-  defp collect_locator(_tree, nil, _step, _count, acc, _n), do: acc
-  defp collect_locator(_tree, _hash, _step, _count, acc, n) when length(acc) >= n, do: acc
+  # `acc` accumulates oldest-first (each visited hash is prepended); `stride`
+  # doubles once `count` (hashes collected) reaches 10.
+  defp collect_locator(_tree, nil, _stride, _count, acc, _n), do: acc
+  defp collect_locator(_tree, _hash, _stride, _count, acc, n) when length(acc) >= n, do: acc
 
-  defp collect_locator(tree, hash, step, count, acc, n) do
+  defp collect_locator(tree, hash, stride, count, acc, n) do
     acc = [hash | acc]
-    {next, count} = step_back(tree, hash, step, count)
-    next_step = if count >= step, do: {step * 2, 0}, else: {step, count}
-    {s, c} = next_step
-    collect_locator(tree, next, s, c, acc, n)
+    stride = if count >= 10, do: stride * 2, else: stride
+    collect_locator(tree, step_back(tree, hash, stride), stride, count + 1, acc, n)
   end
 
-  defp step_back(tree, hash, _step, count) do
+  # Walk back exactly `k` parents; `nil` once the walk passes the root (`prev: nil`).
+  defp step_back(_tree, hash, 0), do: hash
+
+  defp step_back(tree, hash, k) do
     case tree.nodes[hash] do
-      %{prev: prev} -> {prev, count + 1}
-      _ -> {nil, count}
+      %{prev: nil} -> nil
+      %{prev: prev} -> step_back(tree, prev, k - 1)
+      nil -> nil
     end
+  end
+
+  defp ensure_root_last(hashes, root) do
+    if List.last(hashes) == root, do: hashes, else: hashes ++ [root]
+  end
+
+  # Enforce the max length `n` while keeping `root` as the final entry — drop from
+  # the dense newest hashes, never the root.
+  defp cap_with_root(hashes, n) when length(hashes) <= n, do: hashes
+
+  defp cap_with_root(hashes, n) do
+    Enum.take(hashes, n - 1) ++ [List.last(hashes)]
   end
 
   ## ── prune ──

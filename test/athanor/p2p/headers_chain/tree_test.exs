@@ -174,18 +174,46 @@ defmodule Athanor.P2P.HeadersChain.TreeTest do
   end
 
   describe "locator" do
-    test "yields an exponential step-back locator from tip including root" do
+    test "short chain: tip back to root, no duplicates, root last" do
       tree = open_tree()
       headers = chain(seed_hash(), List.duplicate(@easy, 6))
       {tree, _} = Tree.step(tree, {:connect, headers})
-      hashes = Enum.map(headers, &h/1)
-      tip = List.last(hashes)
+      tip = List.last(Enum.map(headers, &h/1))
 
       {_tree, [{:locator, locator}]} = Tree.step(tree, {:locator, 32})
       assert hd(locator) == tip
       assert List.last(locator) == seed_hash()
-      # Strictly decreasing height, no duplicates.
       assert length(Enum.uniq(locator)) == length(locator)
+    end
+
+    test "deep chain: exponential step-back — far fewer hashes than blocks, widening gaps, root last" do
+      tree = open_tree(window: 1_000)
+      headers = chain(seed_hash(), List.duplicate(@easy, 40))
+      {tree, _} = Tree.step(tree, {:connect, headers})
+      tip = List.last(Enum.map(headers, &h/1))
+
+      {_tree, [{:locator, locator}]} = Tree.step(tree, {:locator, 32})
+      assert hd(locator) == tip
+      assert List.last(locator) == seed_hash()
+      # Exponential, not linear: 41 nodes collapse to far fewer locator entries.
+      assert length(locator) < 20
+
+      heights = Enum.map(locator, fn hash -> tree.nodes[hash].height end)
+      # Strictly decreasing, and the back-steps widen beyond 1 (not a linear walk).
+      assert heights == Enum.sort(heights, :desc)
+      assert length(Enum.uniq(heights)) == length(heights)
+      gaps = heights |> Enum.chunk_every(2, 1, :discard) |> Enum.map(fn [a, b] -> a - b end)
+      assert Enum.any?(gaps, &(&1 > 1)), "expected exponential widening, got linear gaps"
+    end
+
+    test "enforces the max length including root" do
+      tree = open_tree(window: 1_000)
+      headers = chain(seed_hash(), List.duplicate(@easy, 40))
+      {tree, _} = Tree.step(tree, {:connect, headers})
+
+      {_tree, [{:locator, locator}]} = Tree.step(tree, {:locator, 5})
+      assert length(locator) <= 5
+      assert List.last(locator) == seed_hash()
     end
   end
 end

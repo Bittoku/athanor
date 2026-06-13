@@ -35,7 +35,7 @@ defmodule Athanor.Workers.ChainTipVerifier do
   @impl true
   def init(_opts) do
     schedule_check()
-    {:ok, %{last_check: nil, consecutive_synced: 0}}
+    {:ok, %{last_check: nil, consecutive_synced: 0, p2p_authority_suspended: false}}
   end
 
   @impl true
@@ -48,6 +48,26 @@ defmodule Athanor.Workers.ChainTipVerifier do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  # Deep reorg: P2P cannot bridge it, so hand tip authority back to the RPC poll
+  # even while peers stay live (otherwise `chain_tip_p2p_active?/0` would keep the
+  # poll deferring and the index could stall). Cleared when a healthy P2P tip
+  # event arrives (recovery).
+  @impl true
+  def handle_cast({:suspend_p2p_authority, info}, state) do
+    Logger.warning(
+      "ChainTipVerifier: suspending P2P tip authority (#{inspect(info)}); RPC poll resumes"
+    )
+
+    {:noreply, %{state | p2p_authority_suspended: true}}
+  end
+
+  def handle_cast(:resume_p2p_authority, %{p2p_authority_suspended: true} = state) do
+    Logger.info("ChainTipVerifier: P2P tip recovered; resuming P2P tip authority")
+    {:noreply, %{state | p2p_authority_suspended: false}}
+  end
+
+  def handle_cast(:resume_p2p_authority, state), do: {:noreply, state}
+
   ## ── P2P tip-event bridge (§C) ──
 
   @doc """
@@ -58,22 +78,23 @@ defmodule Athanor.Workers.ChainTipVerifier do
   Event hashes are **display order** (as `HeadersChain` emits them).
 
     * `{:extend, hashes}` — new best-chain blocks (ancestor→tip) are enqueued to
-      `BlockProcessor` for normal confirmation.
-    * `{:reorg, %{orphan: orphan, connect: connect}}` — the index is rolled back
-      to the common-ancestor height (one below the lowest orphan height, looked up
-      from `block_process_contexts`) via `BlockProcessor.rollback_to/1`, then the
-      new branch (`connect`, ancestor→tip) is enqueued. If no orphan height is on
-      record, the branch is applied without an explicit rollback and per-block
-      reorg detection reconciles.
+      `BlockProcessor` for normal confirmation; P2P authority is (re)confirmed.
+    * `{:reorg, %{orphan: orphan, connect: connect}}` — the common-ancestor height
+      is resolved (one below the lowest orphan height, from `block_process_contexts`,
+      or `nil` if none on record) and rollback + the new branch (`connect`,
+      ancestor→tip) are dispatched as **one ordered `BlockProcessor.apply_reorg/3`
+      mailbox op**, so rollback can never race in-flight block casts. P2P authority
+      is (re)confirmed.
     * `{:reorg_too_deep, info}` — the fork is deeper than the retained header
-      window, so P2P cannot bridge it: a no-op alert. The periodic RPC poll
-      remains the tip authority for this case.
+      window, so P2P cannot bridge it: P2P tip authority is **suspended** (a cast
+      to this verifier) so the RPC poll resumes catch-up even while peers stay live,
+      until a healthy P2P tip event recovers it.
 
   ## Parameters
     - `event` — the tip event tuple from `HeadersChain`.
     - `opts` (injection seams, for tests): `:processor` (BlockProcessor name/pid,
-      default `BlockProcessor`), `:rollback` (`(height -> any)`, default
-      `&BlockProcessor.rollback_to/1`), `:resolve_height`
+      default `BlockProcessor`), `:verifier` (this GenServer's name/pid for the
+      suspend/resume casts, default `__MODULE__`), `:resolve_height`
       (`(orphan_hashes -> {:ok, height} | :unknown)`, default the Repo lookup).
 
   ## Returns
@@ -84,35 +105,35 @@ defmodule Athanor.Workers.ChainTipVerifier do
 
   @spec apply_tip_event(tuple(), keyword()) :: :ok
   def apply_tip_event({:extend, hashes}, opts) do
+    resume_authority(opts)
     enqueue_blocks(hashes, opts)
   end
 
   def apply_tip_event({:reorg, %{orphan: orphan, connect: connect}}, opts) do
-    case resolve_fork_height(orphan, opts) do
-      {:ok, fork_height} ->
-        Logger.warning(
-          "ChainTipVerifier: P2P reorg — rolling back to height #{fork_height}, " <>
-            "applying #{length(connect)} block(s)"
-        )
+    fork_height =
+      case resolve_fork_height(orphan, opts) do
+        {:ok, height} -> height
+        :unknown -> nil
+      end
 
-        rollback_fun(opts).(fork_height)
-
-      :unknown ->
-        Logger.warning(
-          "ChainTipVerifier: P2P reorg with no recorded orphan heights — applying " <>
-            "#{length(connect)} block(s) without an explicit rollback"
-        )
-    end
-
-    enqueue_blocks(connect, opts)
-  end
-
-  def apply_tip_event({:reorg_too_deep, info}, _opts) do
     Logger.warning(
-      "ChainTipVerifier: deep reorg signalled (#{inspect(info)}) — beyond the header " <>
-        "window; RPC poll remains the tip authority"
+      "ChainTipVerifier: P2P reorg — rollback to #{inspect(fork_height)} + #{length(connect)} " <>
+        "block(s) as one ordered BlockProcessor op"
     )
 
+    resume_authority(opts)
+    processor = Keyword.get(opts, :processor, BlockProcessor)
+    BlockProcessor.apply_reorg(processor, fork_height, connect)
+    :ok
+  end
+
+  def apply_tip_event({:reorg_too_deep, info}, opts) do
+    Logger.warning(
+      "ChainTipVerifier: deep reorg signalled (#{inspect(info)}) — beyond the header " <>
+        "window; suspending P2P tip authority so RPC takes over"
+    )
+
+    GenServer.cast(Keyword.get(opts, :verifier, __MODULE__), {:suspend_p2p_authority, info})
     :ok
   end
 
@@ -142,6 +163,17 @@ defmodule Athanor.Workers.ChainTipVerifier do
     )
   end
 
+  @doc """
+  Whether the RPC poll should defer active catch-up to P2P: only when P2P is the
+  live tip authority (`chain_tip_p2p_active?/1`) **and** it is not currently
+  suspended by a deep-reorg signal. While suspended, the RPC poll takes over even
+  though peers remain live (blocker 2).
+  """
+  @spec should_defer_to_p2p?(boolean(), keyword()) :: boolean()
+  def should_defer_to_p2p?(suspended?, opts \\ []) do
+    not suspended? and chain_tip_p2p_active?(opts)
+  end
+
   ## ── Private ──
 
   defp enqueue_blocks(hashes, opts) do
@@ -150,7 +182,10 @@ defmodule Athanor.Workers.ChainTipVerifier do
     :ok
   end
 
-  defp rollback_fun(opts), do: Keyword.get(opts, :rollback, &BlockProcessor.rollback_to/1)
+  # A healthy P2P tip event means P2P recovered — clear any deep-reorg suspension.
+  defp resume_authority(opts) do
+    GenServer.cast(Keyword.get(opts, :verifier, __MODULE__), :resume_p2p_authority)
+  end
 
   defp resolve_fork_height(orphan, opts) do
     case Keyword.get(opts, :resolve_height) do
@@ -199,12 +234,13 @@ defmodule Athanor.Workers.ChainTipVerifier do
           %{state | consecutive_synced: state.consecutive_synced + 1}
 
         local_height < node_height ->
-          # Behind. When the P2P HeadersChain is the active tip authority it is
-          # already driving catch-up via `apply_tip_event/1`, so the RPC poll
-          # only logs (passive consistency check) and does not double-drive. When
-          # P2P is not active (disabled / zero peers) the RPC poll catches up as
-          # before — cold-start parity.
-          if chain_tip_p2p_active?() do
+          # Behind. When the P2P HeadersChain is the active tip authority (and not
+          # suspended by a deep reorg) it is already driving catch-up via
+          # `apply_tip_event/1`, so the RPC poll only logs (passive consistency
+          # check) and does not double-drive. When P2P is not active (disabled /
+          # zero peers) or suspended, the RPC poll catches up — cold-start parity
+          # and the deep-reorg fallback.
+          if should_defer_to_p2p?(state.p2p_authority_suspended) do
             Logger.debug(
               "ChainTipVerifier: #{node_height - local_height} behind; P2P is active tip authority, deferring catch-up"
             )

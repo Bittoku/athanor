@@ -29,7 +29,9 @@ defmodule Athanor.P2P.HeadersChain do
 
   Injected collaborators: `:seed`, `:on_tip`, `:registry`, `:selector`
   (`(pids -> peer)`), `:now_fun`, `:tick_interval_ms`, `:version`, `:cooldown_ms`,
-  `:window`, `:max_detached_rounds`, `:pow_check` (forwarded to the `Tree`).
+  `:window`, `:max_detached_rounds`, `:pow_check` (forwarded to the `Tree`), and
+  `:pow_limit` (consensus max-target compact; the default `:pow_check` enforces it
+  via `Work.valid_pow?/3`, default `0x1d00ffff`).
   """
 
   use GenServer
@@ -37,10 +39,14 @@ defmodule Athanor.P2P.HeadersChain do
 
   alias Athanor.P2P.Codec.Hash
   alias Athanor.P2P.{Frame, Peer, PeerRegistry}
-  alias Athanor.P2P.HeadersChain.Tree
+  alias Athanor.P2P.HeadersChain.{Tree, Work}
   alias Athanor.P2P.Messages.{Headers, Inv}
 
   @max_inv_items 50_000
+
+  # Consensus pow-limit (max target) compact when none is configured — the
+  # mainnet/testnet value. The tree credits work only for headers at or below it.
+  @default_pow_limit 0x1D00FFFF
 
   ## ── Client API ──
 
@@ -66,7 +72,7 @@ defmodule Athanor.P2P.HeadersChain do
       version: Keyword.get(opts, :version, 70_016),
       cooldown_ms: Keyword.get(opts, :cooldown_ms, 1_000),
       max_detached_rounds: Keyword.get(opts, :max_detached_rounds, 3),
-      tree_opts: Keyword.take(opts, [:window, :pow_check]),
+      tree_opts: build_tree_opts(opts),
       detached_rounds: 0,
       last_getheaders: %{}
     }
@@ -226,4 +232,17 @@ defmodule Athanor.P2P.HeadersChain do
   end
 
   defp schedule_tick(interval_ms), do: Process.send_after(self(), :tick, interval_ms)
+
+  # Tree options. The PoW gate defaults to a **consensus pow-limit-aware** check
+  # (`Work.valid_pow?/3` bound to `:pow_limit`, default mainnet/testnet
+  # `0x1d00ffff`) so the production chain rejects easier-than-consensus headers; an
+  # explicit `:pow_check` (e.g. a test bypass) still wins.
+  defp build_tree_opts(opts) do
+    pow_limit = Keyword.get(opts, :pow_limit, @default_pow_limit)
+    default_check = fn hash, bits -> Work.valid_pow?(hash, bits, pow_limit) end
+
+    opts
+    |> Keyword.take([:window])
+    |> Keyword.put(:pow_check, Keyword.get(opts, :pow_check, default_check))
+  end
 end

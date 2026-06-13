@@ -103,13 +103,19 @@ defmodule Athanor.P2P.HeadersChainTest do
       selector: fn pids -> List.first(pids) end,
       now_fun: fn -> 0 end,
       tick_interval_ms: 60_000,
-      version: @version,
-      pow_check: fn _h, _b -> true end
+      version: @version
     ]
 
-    start_supervised!({HeadersChain, Keyword.merge(defaults, opts)},
-      id: {HeadersChain, make_ref()}
-    )
+    merged = Keyword.merge(defaults, opts)
+
+    # Bypass PoW by default (fixtures are unmined); a test that passes its own
+    # `:pow_check` or a `:pow_limit` exercises the real `Work.valid_pow?` gate.
+    merged =
+      if Keyword.has_key?(merged, :pow_check) or Keyword.has_key?(merged, :pow_limit),
+        do: merged,
+        else: Keyword.put(merged, :pow_check, fn _h, _b -> true end)
+
+    start_supervised!({HeadersChain, merged}, id: {HeadersChain, make_ref()})
   end
 
   defp getheaders_bytes(locator),
@@ -198,6 +204,20 @@ defmodule Athanor.P2P.HeadersChainTest do
 
     # Declares 1 header but supplies no 80-byte body → Headers.parse :need_more/error.
     send(hc, {:peer, peer, :frame, %Frame{command: "headers", payload: <<1, 0, 0>>}})
+    _ = :sys.get_state(hc)
+    refute_received {:tip, _}
+  end
+
+  test "the default pow_check rejects an over-limit (easier-than-consensus) header" do
+    setup_registry()
+    {peer, _sock} = ready_peer()
+    # No :pow_check override → the real Work.valid_pow? against the default
+    # consensus pow-limit (0x1d00ffff). `mk/2` uses regtest-easy @easy bits, whose
+    # target sits above the limit → the header must be rejected, not credited.
+    hc = start_hc(pow_limit: 0x1D00FFFF)
+
+    over_limit = mk(@seed, 1)
+    send(hc, {:peer, peer, :frame, headers_frame([over_limit])})
     _ = :sys.get_state(hc)
     refute_received {:tip, _}
   end
