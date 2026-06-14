@@ -21,7 +21,7 @@ defmodule Athanor.Repo.Migrations.CreateAddressHistories do
     end
 
     create index(:address_histories, ["address", "timestamp DESC"],
-      name: :address_histories_address_timestamp_index
-    )
+             name: :address_histories_address_timestamp_index
+           )
   end
 end

@@ -130,6 +130,7 @@ defmodule Athanor.Indexer.TransactionProcessorOutOfOrderTest do
            "transfer should record its missing parent issuance txid"
 
     transfer_utxo_before = Repo.get_by!(Utxo, txid: transfer_txid_bin, vout: 0)
+
     assert is_nil(transfer_utxo_before.token_id),
            "transfer output must not be tagged while lineage is unknown"
 

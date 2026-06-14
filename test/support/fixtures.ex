@@ -7,6 +7,7 @@ defmodule Athanor.Fixtures do
   """
 
   alias Athanor.Repo
+
   alias Athanor.Schema.{
     WatchingAddress,
     WatchingToken,

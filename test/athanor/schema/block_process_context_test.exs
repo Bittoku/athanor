@@ -32,10 +32,16 @@ defmodule Athanor.Schema.BlockProcessContextTest do
 
     test "enforces unique height" do
       block_process_context_fixture(%{id: "hash_a", height: 100})
+
       {:error, changeset} =
         %BlockProcessContext{}
-        |> BlockProcessContext.changeset(%{id: "hash_b", height: 100, processed_at: DateTime.utc_now() |> DateTime.truncate(:second)})
+        |> BlockProcessContext.changeset(%{
+          id: "hash_b",
+          height: 100,
+          processed_at: DateTime.utc_now() |> DateTime.truncate(:second)
+        })
         |> Repo.insert()
+
       assert %{height: ["has already been taken"]} = errors_on(changeset)
     end
   end

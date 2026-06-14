@@ -40,7 +40,10 @@ defmodule Athanor.Schema.UtxoTest do
     test "enforces unique txid+vout" do
       txid = :crypto.strong_rand_bytes(32)
       utxo_fixture(%{txid: txid, vout: 0})
-      {:error, changeset} = %Utxo{} |> Utxo.changeset(utxo_attrs(%{txid: txid, vout: 0})) |> Repo.insert()
+
+      {:error, changeset} =
+        %Utxo{} |> Utxo.changeset(utxo_attrs(%{txid: txid, vout: 0})) |> Repo.insert()
+
       assert %{txid: ["has already been taken"]} = errors_on(changeset)
     end
   end

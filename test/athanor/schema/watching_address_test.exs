@@ -10,7 +10,9 @@ defmodule Athanor.Schema.WatchingAddressTest do
     end
 
     test "valid with address and name" do
-      changeset = WatchingAddress.changeset(%WatchingAddress{}, %{address: "1ABC123", name: "My Wallet"})
+      changeset =
+        WatchingAddress.changeset(%WatchingAddress{}, %{address: "1ABC123", name: "My Wallet"})
+
       assert changeset.valid?
     end
 
@@ -22,7 +24,10 @@ defmodule Athanor.Schema.WatchingAddressTest do
 
     test "enforces unique address constraint" do
       {:ok, _} = Repo.insert(WatchingAddress.changeset(%WatchingAddress{}, %{address: "1DUP"}))
-      {:error, changeset} = Repo.insert(WatchingAddress.changeset(%WatchingAddress{}, %{address: "1DUP"}))
+
+      {:error, changeset} =
+        Repo.insert(WatchingAddress.changeset(%WatchingAddress{}, %{address: "1DUP"}))
+
       assert %{address: ["has already been taken"]} = errors_on(changeset)
     end
   end
