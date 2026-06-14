@@ -66,6 +66,38 @@ defmodule Athanor.P2P.HeadersChain.Work do
   def compact_to_target(_), do: :error
 
   @doc """
+  Encodes a positive 256-bit `target` to its **canonical** compact `nBits`.
+
+  Canonical means: minimal byte length (no leading zero mantissa byte) and the
+  sign-bit-avoidance shift (if the top mantissa byte would have `0x80` set, the
+  mantissa is shifted right one byte and the exponent bumped) — exactly Bitcoin's
+  `arith_uint256::GetCompact` for a positive value. `compact_to_target/1` is its
+  left inverse for every valid target, but **not** every right inverse: a
+  non-canonical compact that decodes to the same target re-encodes to the single
+  canonical form, so F7.1's consensus check compares a candidate's *raw* `bits`
+  against this canonical value (a non-canonical encoding is rejected).
+
+  ## Returns
+    the canonical compact (`0..0xFFFFFFFF`), or `:error` for a non-positive or
+    out-of-range target.
+  """
+  @spec target_to_compact(pos_integer()) :: compact() | :error
+  def target_to_compact(target)
+      when is_integer(target) and target > 0 and target < @two_256 do
+    size = byte_size(:binary.encode_unsigned(target))
+
+    mantissa =
+      if size <= 3, do: target <<< (8 * (3 - size)), else: target >>> (8 * (size - 3))
+
+    {mantissa, size} =
+      if (mantissa &&& 0x00800000) != 0, do: {mantissa >>> 8, size + 1}, else: {mantissa, size}
+
+    size <<< 24 ||| mantissa
+  end
+
+  def target_to_compact(_), do: :error
+
+  @doc """
   The per-header work `floor(2^256 / (target + 1))`, or `:error` for a malformed
   compact.
   """

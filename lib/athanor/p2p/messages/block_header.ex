@@ -44,4 +44,12 @@ defmodule Athanor.P2P.Messages.BlockHeader do
   """
   @spec bits(t()) :: 0..0xFFFFFFFF
   def bits(%__MODULE__{raw: <<_::binary-72, bits::little-32, _nonce::binary-4>>}), do: bits
+
+  @doc """
+  The block `timestamp` (Unix seconds) as a `uint32`, read from the 4-byte
+  little-endian field at header bytes 68..71. Phase 7 F7.1 needs this for the
+  cw-144 DAA window; the value already lives in the retained 80-byte header.
+  """
+  @spec timestamp(t()) :: 0..0xFFFFFFFF
+  def timestamp(%__MODULE__{raw: <<_::binary-68, ts::little-32, _::binary-8>>}), do: ts
 end

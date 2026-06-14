@@ -8,6 +8,7 @@ defmodule Athanor.P2P.HeadersChain.WorkTest do
   bogus work.
   """
   use ExUnit.Case, async: true
+  import Bitwise
 
   alias Athanor.P2P.Codec.Hash
   alias Athanor.P2P.HeadersChain.Work
@@ -77,6 +78,50 @@ defmodule Athanor.P2P.HeadersChain.WorkTest do
     test "rejects a malformed compact regardless of the limit" do
       refute Work.valid_pow?(:binary.copy(<<0>>, 32), 0x00000000, @pow_limit)
       refute Work.valid_pow?(:binary.copy(<<0>>, 32), 0x01800000, @pow_limit)
+    end
+  end
+
+  describe "target_to_compact/1 (F7.1 T7.1.0, canonical nBits encoder)" do
+    test "encodes the known pow-limit and a harder target to their compacts" do
+      {:ok, pow_limit_target} = Work.compact_to_target(0x1D00FFFF)
+      assert Work.target_to_compact(pow_limit_target) == 0x1D00FFFF
+
+      {:ok, harder} = Work.compact_to_target(0x1C00FFFF)
+      assert Work.target_to_compact(harder) == 0x1C00FFFF
+    end
+
+    test "is the left inverse of compact_to_target for canonical compacts" do
+      for compact <- [0x1D00FFFF, 0x1C00FFFF, 0x1B0404CB, 0x1903A30C, 0x180696F2, 0x05009234] do
+        {:ok, target} = Work.compact_to_target(compact)
+
+        assert Work.target_to_compact(target) == compact,
+               "round-trip failed for 0x#{Integer.to_string(compact, 16)}"
+      end
+    end
+
+    test "emits only the canonical form — a non-canonical compact for the same target is not produced" do
+      # 0x02007f00 and 0x017f0000 both decode to target 127, but only 0x017f0000
+      # is canonical (minimal byte length). The encoder must yield 0x017f0000, so
+      # a candidate header carrying the raw 0x02007f00 fails exact-bits equality (I1).
+      assert {:ok, 127} = Work.compact_to_target(0x02007F00)
+      assert {:ok, 127} = Work.compact_to_target(0x017F0000)
+      assert Work.target_to_compact(127) == 0x017F0000
+      refute Work.target_to_compact(127) == 0x02007F00
+    end
+
+    test "applies the sign-bit-avoidance shift (high mantissa byte never 0x80+)" do
+      # A target whose top byte is 0x80 must be encoded with a leading zero byte and
+      # a bumped exponent, never a mantissa with 0x800000 set (which decodes to :error).
+      target = 0x80 * Integer.pow(2, 8 * 30)
+      compact = Work.target_to_compact(target)
+      assert (compact &&& 0x00800000) == 0
+      assert {:ok, ^target} = Work.compact_to_target(compact)
+    end
+
+    test "rejects a non-positive or out-of-range target" do
+      assert Work.target_to_compact(0) == :error
+      assert Work.target_to_compact(-1) == :error
+      assert Work.target_to_compact(Integer.pow(2, 256)) == :error
     end
   end
 end
