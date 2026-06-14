@@ -116,6 +116,61 @@ defmodule Athanor.P2P.SupervisorTest do
     assert cfg.target > 0
   end
 
+  describe "P2P network derives from the authoritative app network (blocker 2)" do
+    setup do
+      prev_p2p = Application.get_env(:athanor, Athanor.P2P, [])
+      prev_net = Application.fetch_env(:athanor, :network)
+      # No Athanor.P2P :network override: the P2P network must follow config :network.
+      Application.put_env(:athanor, Athanor.P2P, Keyword.delete(prev_p2p, :network))
+
+      on_exit(fn ->
+        Application.put_env(:athanor, Athanor.P2P, prev_p2p)
+
+        case prev_net do
+          {:ok, v} -> Application.put_env(:athanor, :network, v)
+          :error -> Application.delete_env(:athanor, :network)
+        end
+      end)
+
+      :ok
+    end
+
+    # The mainnet checker yields :insufficient_window for an empty window; only the
+    # testnet default yields :testnet_daa_unsupported — a crisp discriminator.
+    defp daa_default_result(network_name, pow_limit) do
+      check = HeadersChain.default_daa_check(network_name, pow_limit)
+      header = %Athanor.P2P.Messages.BlockHeader{raw: <<0::640>>}
+      check.(%{}, header, fn _node, _n -> nil end)
+    end
+
+    test "NETWORK=mainnet (no Athanor.P2P override) arms the mainnet cw-144 checker" do
+      Application.put_env(:athanor, :network, "mainnet")
+      cfg = Athanor.P2P.Supervisor.runtime_pool_config()
+
+      assert cfg.network.name == :mainnet
+
+      assert daa_default_result(cfg.network.name, cfg.network.pow_limit) ==
+               {:error, :insufficient_window}
+    end
+
+    test "NETWORK=testnet keeps the intentional fail-closed stub" do
+      Application.put_env(:athanor, :network, "testnet")
+      cfg = Athanor.P2P.Supervisor.runtime_pool_config()
+
+      assert cfg.network.name == :testnet
+
+      assert daa_default_result(cfg.network.name, cfg.network.pow_limit) ==
+               {:error, :testnet_daa_unsupported}
+    end
+
+    test "an explicit Athanor.P2P :network override still wins" do
+      Application.put_env(:athanor, :network, "mainnet")
+      Application.put_env(:athanor, Athanor.P2P, network: :testnet)
+
+      assert Athanor.P2P.Supervisor.runtime_pool_config().network.name == :testnet
+    end
+  end
+
   ## ── Phase 3: observer wiring (the !12 review's blocker 1) ──
 
   test "starts the MempoolObserver under the tree, registered under its name" do

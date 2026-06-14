@@ -33,20 +33,47 @@ defmodule Athanor.P2P.HeadersChain.Tree do
   PoW is checked through an injected `:pow_check` (`(wire_hash, bits) -> boolean`,
   default `Work.meets_target?/2`) so the work/reorg logic is unit-testable without
   mining; a header failing the check is rejected (never added, no work credited).
+
+  Phase 7 F7.1 adds a second, **context-aware** `:daa_check`
+  (`(parent_node, header, ancestor_fun) -> :ok | {:error, reason}`, default a
+  no-op `:ok` bypass) evaluated *after* `:pow_check`. It is the consensus cw-144
+  difficulty gate: `ancestor_fun.(node, n)` walks `prev` `n` steps over the
+  retained nodes (returning the node, or `nil` at/below the synthetic root or off
+  the window), so the gate can recompute the required `bits` from the parent
+  window. **Every** non-`:ok` result rejects the header (never added, no work
+  credited — fail closed). The default bypass keeps the pure work/reorg core
+  mine- and chain-free; production binds the real gate (see
+  `HeadersChain.daa_checker/1`).
   """
 
   alias Athanor.P2P.HeadersChain.Work
   alias Athanor.P2P.Messages.BlockHeader
 
-  defstruct nodes: %{}, tip: nil, root: nil, window: 144, seq: 0, pow_check: nil
+  # Retained-window depth (decision §D2). It must hold the full cw-144 DAA window
+  # (`P..P-146` = 147 blocks) for **every** block a reorg could re-validate: a reorg
+  # of depth `d` connects blocks down to `tip-d+1`, the deepest of which needs
+  # ancestry down to `tip-d-145`. With the reorg budget of 144 that is
+  # `147 + 144 = 291`. A smaller window would silently demote post-prune operation
+  # to the Phase-6 pow-only gate (the `daa_check` would underflow); 291 keeps the
+  # DAA window above the validation frontier so it never does.
+  @default_window 291
+
+  defstruct nodes: %{},
+            tip: nil,
+            root: nil,
+            window: @default_window,
+            seq: 0,
+            pow_check: nil,
+            daa_check: nil
 
   @type wire_hash :: <<_::256>>
   @type t :: %__MODULE__{}
 
   @doc """
   Builds a tree seeded with a synthetic root at `seed_hash` (wire order) /
-  `seed_height`. Options: `:window` (default 144), `:pow_check` (default
-  `&Work.meets_target?/2`).
+  `seed_height`. Options: `:window` (default #{@default_window} — the cw-144 DAA
+  window plus the reorg budget, §D2), `:pow_check` (default `&Work.meets_target?/2`),
+  `:daa_check` (default the `:ok` bypass).
   """
   @spec new(wire_hash(), non_neg_integer(), keyword()) :: t()
   def new(seed_hash, seed_height, opts \\ []) do
@@ -56,10 +83,47 @@ defmodule Athanor.P2P.HeadersChain.Tree do
       nodes: %{seed_hash => root},
       tip: seed_hash,
       root: seed_hash,
-      window: Keyword.get(opts, :window, 144),
+      window: Keyword.get(opts, :window, @default_window),
       seq: 1,
-      pow_check: Keyword.get(opts, :pow_check, &Work.meets_target?/2)
+      pow_check: Keyword.get(opts, :pow_check, &Work.meets_target?/2),
+      daa_check: Keyword.get(opts, :daa_check, &__MODULE__.ok_daa/3)
     }
+  end
+
+  @doc false
+  # Default `:daa_check` — a no-op bypass keeping the pure core mine-free.
+  def ok_daa(_parent_node, _header, _ancestor_fun), do: :ok
+
+  @doc """
+  An `ancestor_fun` bound to `tree`: `ancestor_fun.(node, n)` returns the `n`-th
+  ancestor of `node` by walking `prev` (`n = 0` → `node`), or `nil` once the walk
+  reaches the synthetic root (`header: nil`) or runs off the retained window. This
+  is what `connect_one/2` passes to `:daa_check`; exposed so production wiring and
+  tests share one walker.
+  """
+  @spec ancestor_fun(t()) :: (map(), non_neg_integer() -> map() | nil)
+  def ancestor_fun(%__MODULE__{} = tree), do: fn node, n -> ancestor(tree, node, n) end
+
+  @doc """
+  Plants a contiguous ascending list of **trusted** real `headers` directly above
+  the synthetic root — the Phase 7 F7.1 §D1 bootstrap window. These headers come
+  from the trusted REST/RPC checkpoint source and are seeded **without** the
+  `:pow_check`/`:daa_check` gates (they *are* the seed), so that the first
+  P2P-learned header above the checkpoint already has a full cw-144 ancestor window
+  (`P..P-146`) and is DAA-validated — no pow-only boundary (I3).
+
+  Each header's wire parent must equal the running tip (the synthetic root for the
+  first); a discontiguous list raises (the caller seeds inert and retries). Advances
+  `cum_work`/height and sets `tip` to the last header.
+  """
+  @spec seed_window(t(), [BlockHeader.t()]) :: t()
+  def seed_window(%__MODULE__{} = tree, headers) when is_list(headers) do
+    Enum.reduce(headers, tree, fn header, t ->
+      hash = BlockHeader.hash(header)
+      parent = BlockHeader.prev_hash_wire(header)
+      ^parent = t.tip
+      %{add_node(t, hash, parent, header) | tip: hash}
+    end)
   end
 
   @doc "The height of the window's low edge (the synthetic root / seed height)."
@@ -101,9 +165,24 @@ defmodule Athanor.P2P.HeadersChain.Tree do
       Map.has_key?(tree.nodes, hash) -> {tree, detached}
       not Map.has_key?(tree.nodes, parent) -> {tree, detached + 1}
       not tree.pow_check.(hash, BlockHeader.bits(header)) -> {tree, detached}
+      tree.daa_check.(tree.nodes[parent], header, ancestor_fun(tree)) != :ok -> {tree, detached}
       true -> {add_node(tree, hash, parent, header), detached}
     end
   end
+
+  # The `n`-th ancestor of `node` by `prev`; `nil` at/below the synthetic root
+  # (`header: nil`) or once the walk runs off the retained window.
+  defp ancestor(_tree, %{header: nil}, _n), do: nil
+  defp ancestor(_tree, node, 0), do: node
+
+  defp ancestor(tree, %{prev: prev}, n) when not is_nil(prev) do
+    case tree.nodes[prev] do
+      nil -> nil
+      parent -> ancestor(tree, parent, n - 1)
+    end
+  end
+
+  defp ancestor(_tree, _node, _n), do: nil
 
   defp add_node(tree, hash, parent, header) do
     {:ok, work} = Work.work(BlockHeader.bits(header))

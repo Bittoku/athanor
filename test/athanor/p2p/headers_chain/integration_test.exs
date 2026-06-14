@@ -120,6 +120,7 @@ defmodule Athanor.P2P.HeadersChain.IntegrationTest do
         seed: fn -> {:ok, @seed_height, @root} end,
         on_tip: fn ev -> send(test, {:tip, ev}) end,
         pow_check: fn _h, _b -> true end,
+        daa_check: fn _p, _h, _a -> :ok end,
         tick_interval_ms: 60_000
       ] ++ headers_extra
 

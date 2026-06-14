@@ -68,6 +68,19 @@ defmodule Athanor.Blockchain.RpcClient do
   end
 
   @doc """
+  Returns a block **header** for a given block hash. With `verbose: false` (the
+  default) the result is the 80-byte header as a 160-char hex string — small even
+  for large blocks (unlike `get_block/2`, which returns the whole block).
+
+  ## Returns
+    - `{:ok, header_hex}` (verbose false) or `{:ok, header_map}` (verbose true)
+    - `{:error, reason}` — on RPC or network failure
+  """
+  def get_block_header(hash_hex, verbose \\ false) do
+    GenServer.call(__MODULE__, {:get_block_header, hash_hex, verbose})
+  end
+
+  @doc """
   Returns raw transaction data for a given txid.
 
   ## Parameters
@@ -121,6 +134,11 @@ defmodule Athanor.Blockchain.RpcClient do
 
   def handle_call({:get_block_hash, height}, _from, state) do
     {result, state} = rpc_call("getblockhash", [height], state)
+    {:reply, result, state}
+  end
+
+  def handle_call({:get_block_header, hash_hex, verbose}, _from, state) do
+    {result, state} = rpc_call("getblockheader", [hash_hex, verbose], state)
     {:reply, result, state}
   end
 

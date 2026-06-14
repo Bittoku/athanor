@@ -45,8 +45,8 @@ defmodule Athanor.P2P.HeadersChain do
 
   alias Athanor.P2P.Codec.Hash
   alias Athanor.P2P.{Frame, Peer, PeerRegistry}
-  alias Athanor.P2P.HeadersChain.{Tree, Work}
-  alias Athanor.P2P.Messages.{Headers, Inv}
+  alias Athanor.P2P.HeadersChain.{Daa, Tree, Work}
+  alias Athanor.P2P.Messages.{BlockHeader, Headers, Inv}
 
   @max_inv_items 50_000
 
@@ -88,6 +88,12 @@ defmodule Athanor.P2P.HeadersChain do
       cooldown_ms: Keyword.get(opts, :cooldown_ms, 1_000),
       max_detached_rounds: Keyword.get(opts, :max_detached_rounds, 3),
       tree_opts: build_tree_opts(opts),
+      # The cw-144 DAA gate is "armed" whenever `:daa_check` is **defaulted** (the
+      # production mainnet checker or the testnet fail-closed stub) — both reject a
+      # header lacking a full window. A caller that passes an explicit `:daa_check`
+      # (e.g. a fixture/legacy bypass) takes responsibility and is not armed. Used
+      # to refuse the windowless 3-tuple seed under an armed gate (§D1, fail closed).
+      daa_armed?: not Keyword.has_key?(opts, :daa_check),
       detached_rounds: 0,
       detached_peer: nil,
       last_getheaders: %{},
@@ -266,12 +272,42 @@ defmodule Athanor.P2P.HeadersChain do
 
   defp ensure_seeded(%{tree: nil} = state) do
     case safe_call(state.seed) do
-      {:ok, height, hash} -> %{state | tree: Tree.new(hash, height, state.tree_opts)}
-      _ -> state
+      # Phase 7 F7.1 §D1: a window-capable seed plants the synthetic root at
+      # `root_height` and seeds the trusted real headers above it, so the DAA gate
+      # has a full window from the first P2P header. A bad/discontiguous window
+      # leaves the chain inert (it must not seed without a window under the armed
+      # gate, which would reject every header) — it retries on the next tick.
+      {:ok, root_height, root_hash, window} when is_list(window) ->
+        case safe_seed_window(root_hash, root_height, window, state.tree_opts) do
+          {:ok, tree} -> %{state | tree: tree}
+          :error -> state
+        end
+
+      # Legacy/fixture 3-tuple seed: a single synthetic root with **no** DAA window.
+      # Under the armed gate this would look seeded but reject every header for an
+      # insufficient window (never advancing) — so refuse it and stay inert/retry
+      # (§D1, fail closed). It is only honoured when the caller opted out of the gate
+      # with an explicit `:daa_check` bypass (fixtures/legacy).
+      {:ok, height, hash} ->
+        if state.daa_armed?,
+          do: state,
+          else: %{state | tree: Tree.new(hash, height, state.tree_opts)}
+
+      _ ->
+        state
     end
   end
 
   defp ensure_seeded(state), do: state
+
+  defp safe_seed_window(root_hash, root_height, window, tree_opts) do
+    tree = Tree.new(root_hash, root_height, tree_opts)
+    {:ok, Tree.seed_window(tree, window)}
+  rescue
+    _ -> :error
+  catch
+    :exit, _ -> :error
+  end
 
   defp has_block_inv?(payload) do
     case Inv.parse(payload, max_items: @max_inv_items) do
@@ -306,6 +342,65 @@ defmodule Athanor.P2P.HeadersChain do
 
   defp schedule_tick(interval_ms), do: Process.send_after(self(), :tick, interval_ms)
 
+  ## ── F7.1 consensus DAA gate (the Tree `:daa_check` boundary) ──
+
+  @doc """
+  Adapts the headers `Tree`'s nodes to the pure `Daa` node shape and returns the
+  canonical cw-144 `expected_bits` for the child of `parent_node`.
+
+  `tree_ancestor_fun` is the `Tree.ancestor_fun/1` walker (returns a tree node
+  `%{header, cum_work, …}` or `nil`); each non-`nil` ancestor is mapped to a
+  `%{time, cum_work}` DAA node via `BlockHeader.timestamp/1`. Returns
+  `{:ok, canonical_compact}` or `{:error, :insufficient_window}`.
+  """
+  @spec daa_expected_bits(map(), (map(), non_neg_integer() -> map() | nil), Work.compact()) ::
+          {:ok, Work.compact()} | {:error, :insufficient_window}
+  def daa_expected_bits(parent_node, tree_ancestor_fun, pow_limit_compact) do
+    daa_ancestor_fun = fn anchor, n ->
+      case tree_ancestor_fun.(anchor, n) do
+        nil -> nil
+        node -> %{time: BlockHeader.timestamp(node.header), cum_work: node.cum_work}
+      end
+    end
+
+    Daa.expected_bits(parent_node, daa_ancestor_fun, pow_limit_compact)
+  end
+
+  @doc """
+  Builds the production `:daa_check` closure for the `Tree`: it recomputes the
+  cw-144 `expected_bits` from the parent window and requires the candidate's **raw**
+  `BlockHeader.bits/1` to equal it **exactly** (a non-canonical compact for the same
+  target fails). Every error path rejects the header (fail closed, §4.1 / I6):
+  `:difficulty_mismatch` (wrong bits) and `:insufficient_window` (a needed ancestor
+  is missing — must not happen above the seeded bootstrap window).
+  """
+  @spec daa_checker(Work.compact()) :: (map(), BlockHeader.t(), fun() -> :ok | {:error, atom()})
+  def daa_checker(pow_limit_compact) do
+    fn parent_node, header, tree_ancestor_fun ->
+      case daa_expected_bits(parent_node, tree_ancestor_fun, pow_limit_compact) do
+        {:ok, expected} ->
+          if BlockHeader.bits(header) == expected, do: :ok, else: {:error, :difficulty_mismatch}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  The default `:daa_check` for `network` (decision §D3): the real cw-144
+  `daa_checker/1` on **mainnet**, and a **fail-closed stub** on testnet that returns
+  `{:error, :testnet_daa_unsupported}` (never a silent `:ok`). F7.1 is scoped to the
+  mainnet rule; the testnet 20-minute minimum-difficulty rule is carved out to a
+  follow-up, so running on testnet rejects rather than mis-validates.
+  """
+  @spec default_daa_check(:mainnet | :testnet, Work.compact()) ::
+          (map(), BlockHeader.t(), fun() -> :ok | {:error, atom()})
+  def default_daa_check(:testnet, _pow_limit_compact),
+    do: fn _parent_node, _header, _ancestor_fun -> {:error, :testnet_daa_unsupported} end
+
+  def default_daa_check(_mainnet, pow_limit_compact), do: daa_checker(pow_limit_compact)
+
   # Tree options. The PoW gate defaults to a **consensus pow-limit-aware** check
   # (`Work.valid_pow?/3` bound to `:pow_limit`, default mainnet/testnet
   # `0x1d00ffff`) so the production chain rejects easier-than-consensus headers; an
@@ -314,8 +409,18 @@ defmodule Athanor.P2P.HeadersChain do
     pow_limit = Keyword.get(opts, :pow_limit, @default_pow_limit)
     default_check = fn hash, bits -> Work.valid_pow?(hash, bits, pow_limit) end
 
+    # F7.1: default the cw-144 DAA gate from the `:network` the supervisor passes
+    # (resolved from app env, like `:pow_limit`); no GenServer call at init. Testnet
+    # is a fail-closed stub (§D3). An explicit `:daa_check`/`:pow_check` still wins;
+    # the `:mainnet` fallback only applies to a direct start without `:network`.
+    daa_check =
+      Keyword.get_lazy(opts, :daa_check, fn ->
+        default_daa_check(Keyword.get(opts, :network, :mainnet), pow_limit)
+      end)
+
     opts
     |> Keyword.take([:window])
     |> Keyword.put(:pow_check, Keyword.get(opts, :pow_check, default_check))
+    |> Keyword.put(:daa_check, daa_check)
   end
 end
