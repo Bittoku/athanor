@@ -60,6 +60,12 @@ defmodule Athanor.P2P.HeadersChain.LiveSmokeTest do
     headers_opts = [
       seed: fn -> {:ok, 0, genesis_wire} end,
       on_tip: fn ev -> send(test, {:tip, ev}) end,
+      # This is a *wire* smoke: it proves real headers pull off live peers and
+      # extend the tip with real PoW. The F7.1 cw-144 DAA gate is bypassed here
+      # because a from-genesis 3-tuple seed has no 147-header bootstrap window, so
+      # the armed gate would (correctly) refuse to seed and the chain would stay
+      # inert. DAA correctness is covered by the mainnet golden-vector unit tests.
+      daa_check: fn _parent, _header, _ancestor_fun -> :ok end,
       tick_interval_ms: 2_000
     ]
 
