@@ -45,8 +45,8 @@ defmodule Athanor.P2P.HeadersChain do
 
   alias Athanor.P2P.Codec.Hash
   alias Athanor.P2P.{Frame, Peer, PeerRegistry}
-  alias Athanor.P2P.HeadersChain.{Tree, Work}
-  alias Athanor.P2P.Messages.{Headers, Inv}
+  alias Athanor.P2P.HeadersChain.{Daa, Tree, Work}
+  alias Athanor.P2P.Messages.{BlockHeader, Headers, Inv}
 
   @max_inv_items 50_000
 
@@ -305,6 +305,51 @@ defmodule Athanor.P2P.HeadersChain do
   end
 
   defp schedule_tick(interval_ms), do: Process.send_after(self(), :tick, interval_ms)
+
+  ## ── F7.1 consensus DAA gate (the Tree `:daa_check` boundary) ──
+
+  @doc """
+  Adapts the headers `Tree`'s nodes to the pure `Daa` node shape and returns the
+  canonical cw-144 `expected_bits` for the child of `parent_node`.
+
+  `tree_ancestor_fun` is the `Tree.ancestor_fun/1` walker (returns a tree node
+  `%{header, cum_work, …}` or `nil`); each non-`nil` ancestor is mapped to a
+  `%{time, cum_work}` DAA node via `BlockHeader.timestamp/1`. Returns
+  `{:ok, canonical_compact}` or `{:error, :insufficient_window}`.
+  """
+  @spec daa_expected_bits(map(), (map(), non_neg_integer() -> map() | nil), Work.compact()) ::
+          {:ok, Work.compact()} | {:error, :insufficient_window}
+  def daa_expected_bits(parent_node, tree_ancestor_fun, pow_limit_compact) do
+    daa_ancestor_fun = fn anchor, n ->
+      case tree_ancestor_fun.(anchor, n) do
+        nil -> nil
+        node -> %{time: BlockHeader.timestamp(node.header), cum_work: node.cum_work}
+      end
+    end
+
+    Daa.expected_bits(parent_node, daa_ancestor_fun, pow_limit_compact)
+  end
+
+  @doc """
+  Builds the production `:daa_check` closure for the `Tree`: it recomputes the
+  cw-144 `expected_bits` from the parent window and requires the candidate's **raw**
+  `BlockHeader.bits/1` to equal it **exactly** (a non-canonical compact for the same
+  target fails). Every error path rejects the header (fail closed, §4.1 / I6):
+  `:difficulty_mismatch` (wrong bits) and `:insufficient_window` (a needed ancestor
+  is missing — must not happen above the seeded bootstrap window).
+  """
+  @spec daa_checker(Work.compact()) :: (map(), BlockHeader.t(), fun() -> :ok | {:error, atom()})
+  def daa_checker(pow_limit_compact) do
+    fn parent_node, header, tree_ancestor_fun ->
+      case daa_expected_bits(parent_node, tree_ancestor_fun, pow_limit_compact) do
+        {:ok, expected} ->
+          if BlockHeader.bits(header) == expected, do: :ok, else: {:error, :difficulty_mismatch}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
 
   # Tree options. The PoW gate defaults to a **consensus pow-limit-aware** check
   # (`Work.valid_pow?/3` bound to `:pow_limit`, default mainnet/testnet

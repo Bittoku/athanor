@@ -33,12 +33,23 @@ defmodule Athanor.P2P.HeadersChain.Tree do
   PoW is checked through an injected `:pow_check` (`(wire_hash, bits) -> boolean`,
   default `Work.meets_target?/2`) so the work/reorg logic is unit-testable without
   mining; a header failing the check is rejected (never added, no work credited).
+
+  Phase 7 F7.1 adds a second, **context-aware** `:daa_check`
+  (`(parent_node, header, ancestor_fun) -> :ok | {:error, reason}`, default a
+  no-op `:ok` bypass) evaluated *after* `:pow_check`. It is the consensus cw-144
+  difficulty gate: `ancestor_fun.(node, n)` walks `prev` `n` steps over the
+  retained nodes (returning the node, or `nil` at/below the synthetic root or off
+  the window), so the gate can recompute the required `bits` from the parent
+  window. **Every** non-`:ok` result rejects the header (never added, no work
+  credited — fail closed). The default bypass keeps the pure work/reorg core
+  mine- and chain-free; production binds the real gate (see
+  `HeadersChain.daa_checker/1`).
   """
 
   alias Athanor.P2P.HeadersChain.Work
   alias Athanor.P2P.Messages.BlockHeader
 
-  defstruct nodes: %{}, tip: nil, root: nil, window: 144, seq: 0, pow_check: nil
+  defstruct nodes: %{}, tip: nil, root: nil, window: 144, seq: 0, pow_check: nil, daa_check: nil
 
   @type wire_hash :: <<_::256>>
   @type t :: %__MODULE__{}
@@ -58,9 +69,24 @@ defmodule Athanor.P2P.HeadersChain.Tree do
       root: seed_hash,
       window: Keyword.get(opts, :window, 144),
       seq: 1,
-      pow_check: Keyword.get(opts, :pow_check, &Work.meets_target?/2)
+      pow_check: Keyword.get(opts, :pow_check, &Work.meets_target?/2),
+      daa_check: Keyword.get(opts, :daa_check, &__MODULE__.ok_daa/3)
     }
   end
+
+  @doc false
+  # Default `:daa_check` — a no-op bypass keeping the pure core mine-free.
+  def ok_daa(_parent_node, _header, _ancestor_fun), do: :ok
+
+  @doc """
+  An `ancestor_fun` bound to `tree`: `ancestor_fun.(node, n)` returns the `n`-th
+  ancestor of `node` by walking `prev` (`n = 0` → `node`), or `nil` once the walk
+  reaches the synthetic root (`header: nil`) or runs off the retained window. This
+  is what `connect_one/2` passes to `:daa_check`; exposed so production wiring and
+  tests share one walker.
+  """
+  @spec ancestor_fun(t()) :: (map(), non_neg_integer() -> map() | nil)
+  def ancestor_fun(%__MODULE__{} = tree), do: fn node, n -> ancestor(tree, node, n) end
 
   @doc "The height of the window's low edge (the synthetic root / seed height)."
   @spec root_height(t()) :: non_neg_integer()
@@ -101,9 +127,24 @@ defmodule Athanor.P2P.HeadersChain.Tree do
       Map.has_key?(tree.nodes, hash) -> {tree, detached}
       not Map.has_key?(tree.nodes, parent) -> {tree, detached + 1}
       not tree.pow_check.(hash, BlockHeader.bits(header)) -> {tree, detached}
+      tree.daa_check.(tree.nodes[parent], header, ancestor_fun(tree)) != :ok -> {tree, detached}
       true -> {add_node(tree, hash, parent, header), detached}
     end
   end
+
+  # The `n`-th ancestor of `node` by `prev`; `nil` at/below the synthetic root
+  # (`header: nil`) or once the walk runs off the retained window.
+  defp ancestor(_tree, %{header: nil}, _n), do: nil
+  defp ancestor(_tree, node, 0), do: node
+
+  defp ancestor(tree, %{prev: prev}, n) when not is_nil(prev) do
+    case tree.nodes[prev] do
+      nil -> nil
+      parent -> ancestor(tree, parent, n - 1)
+    end
+  end
+
+  defp ancestor(_tree, _node, _n), do: nil
 
   defp add_node(tree, hash, parent, header) do
     {:ok, work} = Work.work(BlockHeader.bits(header))
