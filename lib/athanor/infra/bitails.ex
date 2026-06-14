@@ -2,6 +2,10 @@ defmodule Athanor.Infra.Bitails do
   @moduledoc """
   REST client for the Bitails API.
   Provides additional transaction data not available from the BSV node.
+
+  HTTP transport options are read from `Application.get_env(:athanor,
+  :bitails_http_opts, [finch: Athanor.Finch])`. Tests set
+  `[plug: {Req.Test, :bitails_stub}]` to route through a `Req.Test` stub.
   """
 
   require Logger
@@ -14,7 +18,7 @@ defmodule Athanor.Infra.Bitails do
   def get_tx(txid) do
     url = "#{@base_url}/tx/#{txid}"
 
-    case Req.get(url, finch: Athanor.Finch) do
+    case Req.get(url, http_opts()) do
       {:ok, %Req.Response{status: 200, body: body}} when is_map(body) ->
         {:ok, body}
 
@@ -33,7 +37,7 @@ defmodule Athanor.Infra.Bitails do
   def get_raw_tx(txid) do
     url = "#{@base_url}/tx/#{txid}/raw"
 
-    case Req.get(url, finch: Athanor.Finch) do
+    case Req.get(url, http_opts()) do
       {:ok, %Req.Response{status: 200, body: body}} when is_binary(body) ->
         {:ok, String.trim(body)}
 
@@ -51,7 +55,7 @@ defmodule Athanor.Infra.Bitails do
   def get_address_balance(address) do
     url = "#{@base_url}/address/#{address}/balance"
 
-    case Req.get(url, finch: Athanor.Finch) do
+    case Req.get(url, http_opts()) do
       {:ok, %Req.Response{status: 200, body: body}} when is_map(body) ->
         {:ok, body}
 
@@ -62,4 +66,6 @@ defmodule Athanor.Infra.Bitails do
         {:error, reason}
     end
   end
+
+  defp http_opts, do: Application.get_env(:athanor, :bitails_http_opts, finch: Athanor.Finch)
 end
