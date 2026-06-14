@@ -149,20 +149,62 @@ defmodule Athanor.P2P.Supervisor do
     [
       seed: &rpc_seed/0,
       on_tip: &Athanor.Indexer.TipController.notify_tip/1,
-      pow_limit: network.pow_limit
+      pow_limit: network.pow_limit,
+      network: network.name
     ]
   end
 
-  # Seed the header tree from the node's current best block via RPC. Returns
-  # `{:ok, height, wire_hash}` — the hash is converted display→wire order to match
-  # how header `prev_block`/`hash` bytes arrive on the P2P wire. Any RPC/decoding
-  # failure returns `{:error, _}`; the chain then starts inert and retries on tick
-  # (a failed seed never crashes the supervisor).
+  # The cw-144 DAA needs the parent and its 146 ancestors; F7.1 §D1 seeds that full
+  # window below the checkpoint so the first P2P header is DAA-validated.
+  @daa_seed_window 147
+
+  # Seed the header tree from the node's current best block via RPC, **with the full
+  # cw-144 bootstrap window** (F7.1 §D1). Walks `getblockheader` from the tip down
+  # `@daa_seed_window` blocks via each header's `prev_block`, and returns a
+  # window-capable seed `{:ok, root_height, root_wire_hash, [%BlockHeader{} ascending]}`
+  # — the synthetic root sits at `tip - 147` and the 147 real headers are planted
+  # above it. Any RPC/decoding failure returns `{:error, _}`; the chain then starts
+  # inert and retries on tick (a failed seed never crashes the supervisor, and it
+  # must not seed without a window under the armed DAA gate).
   defp rpc_seed do
-    with {:ok, height} <- Athanor.Blockchain.RpcClient.get_block_count(),
-         {:ok, hash_hex} <- Athanor.Blockchain.RpcClient.get_block_hash(height),
-         {:ok, display} <- Base.decode16(hash_hex, case: :mixed) do
-      {:ok, height, Athanor.P2P.Codec.Hash.display_to_wire(display)}
+    with {:ok, tip_height} <- Athanor.Blockchain.RpcClient.get_block_count(),
+         {:ok, tip_hash_hex} <- Athanor.Blockchain.RpcClient.get_block_hash(tip_height),
+         {:ok, ascending} <- fetch_header_window(tip_hash_hex, @daa_seed_window) do
+      first = hd(ascending)
+      root_wire_hash = Athanor.P2P.Messages.BlockHeader.prev_hash_wire(first)
+      {:ok, tip_height - @daa_seed_window, root_wire_hash, ascending}
+    else
+      other -> {:error, other}
+    end
+  end
+
+  # Walk `count` headers down from `start_hash_hex` (display hex) via each header's
+  # `prev_block`, returning them **ascending** (lowest height first) as
+  # `%BlockHeader{}`, or `{:error, _}` on any RPC/decode failure.
+  defp fetch_header_window(start_hash_hex, count) do
+    1..count
+    |> Enum.reduce_while({:ok, [], start_hash_hex}, fn _i, {:ok, acc, hash_hex} ->
+      case fetch_header(hash_hex) do
+        {:ok, header} ->
+          parent_display = Athanor.P2P.Messages.BlockHeader.prev_hash(header)
+          {:cont, {:ok, [header | acc], Base.encode16(parent_display, case: :lower)}}
+
+        err ->
+          {:halt, err}
+      end
+    end)
+    |> case do
+      {:ok, headers, _next} -> {:ok, headers}
+      err -> err
+    end
+  end
+
+  # The 80-byte header for `hash_hex` as a `%BlockHeader{}` (via `getblockheader`,
+  # which is tiny even for very large blocks).
+  defp fetch_header(hash_hex) do
+    with {:ok, header_hex} <- Athanor.Blockchain.RpcClient.get_block_header(hash_hex, false),
+         {:ok, <<raw::binary-80, _::binary>>} <- Base.decode16(header_hex, case: :mixed) do
+      {:ok, %Athanor.P2P.Messages.BlockHeader{raw: raw}}
     else
       other -> {:error, other}
     end

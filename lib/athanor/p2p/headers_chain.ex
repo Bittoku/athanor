@@ -266,12 +266,35 @@ defmodule Athanor.P2P.HeadersChain do
 
   defp ensure_seeded(%{tree: nil} = state) do
     case safe_call(state.seed) do
-      {:ok, height, hash} -> %{state | tree: Tree.new(hash, height, state.tree_opts)}
-      _ -> state
+      # Phase 7 F7.1 §D1: a window-capable seed plants the synthetic root at
+      # `root_height` and seeds the trusted real headers above it, so the DAA gate
+      # has a full window from the first P2P header. A bad/discontiguous window
+      # leaves the chain inert (it must not seed without a window under the armed
+      # gate, which would reject every header) — it retries on the next tick.
+      {:ok, root_height, root_hash, window} when is_list(window) ->
+        case safe_seed_window(root_hash, root_height, window, state.tree_opts) do
+          {:ok, tree} -> %{state | tree: tree}
+          :error -> state
+        end
+
+      {:ok, height, hash} ->
+        %{state | tree: Tree.new(hash, height, state.tree_opts)}
+
+      _ ->
+        state
     end
   end
 
   defp ensure_seeded(state), do: state
+
+  defp safe_seed_window(root_hash, root_height, window, tree_opts) do
+    tree = Tree.new(root_hash, root_height, tree_opts)
+    {:ok, Tree.seed_window(tree, window)}
+  rescue
+    _ -> :error
+  catch
+    :exit, _ -> :error
+  end
 
   defp has_block_inv?(payload) do
     case Inv.parse(payload, max_items: @max_inv_items) do
@@ -373,14 +396,13 @@ defmodule Athanor.P2P.HeadersChain do
     pow_limit = Keyword.get(opts, :pow_limit, @default_pow_limit)
     default_check = fn hash, bits -> Work.valid_pow?(hash, bits, pow_limit) end
 
-    # F7.1: default the cw-144 DAA gate, network-resolved **lazily** (only when no
-    # explicit `:daa_check` is given) so the network need not be resolved when the
-    # gate is overridden. Testnet is a fail-closed stub (§D3). An explicit
-    # `:daa_check`/`:pow_check` still wins.
+    # F7.1: default the cw-144 DAA gate from the `:network` the supervisor passes
+    # (resolved from app env, like `:pow_limit`); no GenServer call at init. Testnet
+    # is a fail-closed stub (§D3). An explicit `:daa_check`/`:pow_check` still wins;
+    # the `:mainnet` fallback only applies to a direct start without `:network`.
     daa_check =
       Keyword.get_lazy(opts, :daa_check, fn ->
-        network = Keyword.get(opts, :network, Athanor.Blockchain.Network.network())
-        default_daa_check(network, pow_limit)
+        default_daa_check(Keyword.get(opts, :network, :mainnet), pow_limit)
       end)
 
     opts

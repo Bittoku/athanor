@@ -174,6 +174,7 @@ defmodule Athanor.Indexer.TipControllerIntegrationTest do
       seed: fn -> {:ok, 105, @root} end,
       on_tip: &TipController.notify_tip/1,
       pow_check: fn _h, _b -> true end,
+      daa_check: fn _parent, _header, _ancestor_fun -> :ok end,
       tick_interval_ms: 60_000
     ]
 

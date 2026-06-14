@@ -104,6 +104,28 @@ defmodule Athanor.P2P.HeadersChain.Tree do
   @spec ancestor_fun(t()) :: (map(), non_neg_integer() -> map() | nil)
   def ancestor_fun(%__MODULE__{} = tree), do: fn node, n -> ancestor(tree, node, n) end
 
+  @doc """
+  Plants a contiguous ascending list of **trusted** real `headers` directly above
+  the synthetic root — the Phase 7 F7.1 §D1 bootstrap window. These headers come
+  from the trusted REST/RPC checkpoint source and are seeded **without** the
+  `:pow_check`/`:daa_check` gates (they *are* the seed), so that the first
+  P2P-learned header above the checkpoint already has a full cw-144 ancestor window
+  (`P..P-146`) and is DAA-validated — no pow-only boundary (I3).
+
+  Each header's wire parent must equal the running tip (the synthetic root for the
+  first); a discontiguous list raises (the caller seeds inert and retries). Advances
+  `cum_work`/height and sets `tip` to the last header.
+  """
+  @spec seed_window(t(), [BlockHeader.t()]) :: t()
+  def seed_window(%__MODULE__{} = tree, headers) when is_list(headers) do
+    Enum.reduce(headers, tree, fn header, t ->
+      hash = BlockHeader.hash(header)
+      parent = BlockHeader.prev_hash_wire(header)
+      ^parent = t.tip
+      %{add_node(t, hash, parent, header) | tip: hash}
+    end)
+  end
+
   @doc "The height of the window's low edge (the synthetic root / seed height)."
   @spec root_height(t()) :: non_neg_integer()
   def root_height(%__MODULE__{root: root, nodes: nodes}), do: nodes[root].height

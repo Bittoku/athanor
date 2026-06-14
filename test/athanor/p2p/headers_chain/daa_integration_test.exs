@@ -187,4 +187,45 @@ defmodule Athanor.P2P.HeadersChain.DaaIntegrationTest do
                {:error, :testnet_daa_unsupported}
     end
   end
+
+  describe "bootstrap window seeding (T7.1.8 / D1)" do
+    test "seed_window plants the real window above the synthetic root; the first header above the checkpoint DAA-validates" do
+      root_hash = :binary.copy(<<0x11>>, 32)
+      root_height = 499_853
+
+      {window, {checkpoint, checkpoint_time}} =
+        build_window(root_hash, 1_600_000_000, 147, @stable_bits)
+
+      tree =
+        Tree.new(root_hash, root_height,
+          pow_check: always_ok(),
+          daa_check: HeadersChain.daa_checker(@pow_limit)
+        )
+        |> Tree.seed_window(window)
+
+      # The synthetic root is unchanged (header: nil) at seed-147; the checkpoint is
+      # the topmost seeded real node and the tip.
+      assert tree.root == root_hash
+      assert tree.nodes[root_hash].header == nil
+      assert tree.tip == checkpoint
+      assert tree.nodes[checkpoint].height == root_height + 147
+
+      # The first P2P header above the checkpoint is DAA-validated (no pow-only
+      # boundary, I3) because it has a full real P..P-146 window.
+      cand = hdr(checkpoint, checkpoint_time + 600, @stable_bits)
+      {t1, _} = Tree.step(tree, {:connect, [cand]})
+      assert Map.has_key?(t1.nodes, BlockHeader.hash(cand))
+
+      # The synthetic root is never reached as a DAA node.
+      assert Tree.ancestor_fun(t1).(tree.nodes[checkpoint], 147) == nil
+    end
+
+    test "seed_window raises on a discontiguous window (the caller seeds inert)" do
+      root_hash = :binary.copy(<<0x22>>, 32)
+      tree = Tree.new(root_hash, 100)
+      orphan = hdr(:binary.copy(<<0x99>>, 32), 1, @stable_bits)
+
+      assert_raise MatchError, fn -> Tree.seed_window(tree, [orphan]) end
+    end
+  end
 end
