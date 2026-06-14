@@ -47,10 +47,14 @@ defmodule Athanor.Tokens.Provenance do
       |> Repo.one()
 
     total_satoshis =
-      Utxo
-      |> where([u], u.token_id == ^token_id and u.is_spent == false)
-      |> select([u], sum(u.satoshis))
-      |> Repo.one() || 0
+      case Utxo
+           |> where([u], u.token_id == ^token_id and u.is_spent == false)
+           |> select([u], sum(u.satoshis))
+           |> Repo.one() do
+        nil -> 0
+        %Decimal{} = d -> Decimal.to_integer(d)
+        n when is_integer(n) -> n
+      end
 
     spent_count =
       Utxo

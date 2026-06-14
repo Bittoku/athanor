@@ -19,8 +19,13 @@ defmodule Athanor.Services.Balance do
     Utxo
     |> where([u], u.address == ^address and u.is_spent == false and is_nil(u.token_type))
     |> select([u], sum(u.satoshis))
-    |> Repo.one() || 0
+    |> Repo.one()
+    |> normalize_sum()
   end
+
+  defp normalize_sum(nil), do: 0
+  defp normalize_sum(%Decimal{} = d), do: Decimal.to_integer(d)
+  defp normalize_sum(n) when is_integer(n), do: n
 
   @doc """
   Returns full balance breakdown: BSV + per-token balances.
@@ -41,9 +46,12 @@ defmodule Athanor.Services.Balance do
         count: count(u.id)
       })
       |> Repo.all()
+      |> Enum.map(&normalize_token_row/1)
 
     %{bsv: bsv, tokens: tokens}
   end
+
+  defp normalize_token_row(%{satoshis: s} = row), do: %{row | satoshis: normalize_sum(s)}
 
   @doc """
   Returns balances for multiple addresses at once.
@@ -65,5 +73,6 @@ defmodule Athanor.Services.Balance do
       count: count(u.id)
     })
     |> Repo.all()
+    |> Enum.map(&normalize_token_row/1)
   end
 end

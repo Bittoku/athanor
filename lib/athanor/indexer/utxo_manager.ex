@@ -98,6 +98,10 @@ defmodule Athanor.Indexer.UtxoManager do
       |> select([u], %{count: count(u.id), total: sum(u.satoshis)})
       |> Repo.one()
 
-    %{count: result.count, total_satoshis: result.total || 0}
+    %{count: result.count, total_satoshis: normalize_sum(result.total)}
   end
+
+  defp normalize_sum(nil), do: 0
+  defp normalize_sum(%Decimal{} = d), do: Decimal.to_integer(d)
+  defp normalize_sum(n) when is_integer(n), do: n
 end
