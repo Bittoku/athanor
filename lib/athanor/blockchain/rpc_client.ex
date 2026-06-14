@@ -24,7 +24,12 @@ defmodule Athanor.Blockchain.RpcClient do
     `{:ok, pid}` on success.
   """
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    # `:name` defaults to the module name; pass `name: nil` to start an unnamed
+    # instance (test isolation — multiple stubbed clients in one suite).
+    case Keyword.get(opts, :name, __MODULE__) do
+      nil -> GenServer.start_link(__MODULE__, opts)
+      name -> GenServer.start_link(__MODULE__, opts, name: name)
+    end
   end
 
   @doc """
@@ -112,13 +117,17 @@ defmodule Athanor.Blockchain.RpcClient do
   ## ── Server Callbacks ──
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     config = Application.get_env(:athanor, :bsv_node, [])
 
+    # Per-instance `opts` override app config (test injection); `:plug` routes
+    # requests through a `Req.Test` stub instead of the shared Finch pool.
     state = %{
-      rpc_url: Keyword.get(config, :rpc_url, "http://localhost:18332"),
-      rpc_user: Keyword.get(config, :rpc_user),
-      rpc_password: Keyword.get(config, :rpc_password),
+      rpc_url:
+        Keyword.get(opts, :rpc_url, Keyword.get(config, :rpc_url, "http://localhost:18332")),
+      rpc_user: Keyword.get(opts, :rpc_user, Keyword.get(config, :rpc_user)),
+      rpc_password: Keyword.get(opts, :rpc_password, Keyword.get(config, :rpc_password)),
+      plug: Keyword.get(opts, :plug),
       request_id: 0
     }
 
@@ -190,9 +199,9 @@ defmodule Athanor.Blockchain.RpcClient do
         url: state.rpc_url,
         method: :post,
         json: body,
-        receive_timeout: 30_000,
-        finch: Athanor.Finch
+        receive_timeout: 30_000
       ]
+      |> maybe_add_transport(state)
       |> maybe_add_auth(state)
 
     case Req.request(req_opts) do
@@ -216,6 +225,12 @@ defmodule Athanor.Blockchain.RpcClient do
         {{:error, {:request_failed, reason}}, state}
     end
   end
+
+  # Selects the HTTP transport: in production `state.plug` is nil and requests use
+  # the shared Finch pool; in tests it is `{Req.Test, name}` so requests route
+  # through a `Req.Test` stub (no live node).
+  defp maybe_add_transport(opts, %{plug: nil}), do: Keyword.put(opts, :finch, Athanor.Finch)
+  defp maybe_add_transport(opts, %{plug: plug}), do: Keyword.put(opts, :plug, plug)
 
   # Adds basic auth header if credentials are configured.
   defp maybe_add_auth(opts, %{rpc_user: user, rpc_password: pass})
