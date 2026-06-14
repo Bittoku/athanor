@@ -173,17 +173,24 @@ defmodule Athanor.Indexer.TransactionFilter do
   # Returns {[matched_address_strings], [matched_token_id_strings]}.
   @spec scan_outputs([BSV.Transaction.Output.t()]) :: {[String.t()], [String.t()]}
   defp scan_outputs(outputs) do
-    Enum.reduce(outputs, {[], []}, fn output, {addrs_acc, tokens_acc} ->
-      script = output.locking_script
-      script_binary = BSV.Script.to_binary(script)
+    Enum.reduce(outputs, {[], []}, fn output, {addrs_acc, tokens_acc} = acc ->
+      # One malformed output must not lose matches from *other* outputs in the
+      # same tx. The check_* helpers rescue their own classifier errors, but
+      # `BSV.Script.to_binary/1` runs above them and can raise on a bad script.
+      try do
+        script = output.locking_script
+        script_binary = BSV.Script.to_binary(script)
 
-      # Check for watched address (P2PKH)
-      addrs_acc = check_address(script, addrs_acc)
+        # Check for watched address (P2PKH)
+        addrs_acc = check_address(script, addrs_acc)
 
-      # Check for watched STAS / STAS3 token
-      tokens_acc = check_token(script_binary, tokens_acc)
+        # Check for watched STAS / STAS3 token
+        tokens_acc = check_token(script_binary, tokens_acc)
 
-      {addrs_acc, tokens_acc}
+        {addrs_acc, tokens_acc}
+      rescue
+        _ -> acc
+      end
     end)
     |> then(fn {addrs, tokens} -> {Enum.uniq(addrs), Enum.uniq(tokens)} end)
   end
