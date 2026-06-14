@@ -351,6 +351,20 @@ defmodule Athanor.P2P.HeadersChain do
     end
   end
 
+  @doc """
+  The default `:daa_check` for `network` (decision §D3): the real cw-144
+  `daa_checker/1` on **mainnet**, and a **fail-closed stub** on testnet that returns
+  `{:error, :testnet_daa_unsupported}` (never a silent `:ok`). F7.1 is scoped to the
+  mainnet rule; the testnet 20-minute minimum-difficulty rule is carved out to a
+  follow-up, so running on testnet rejects rather than mis-validates.
+  """
+  @spec default_daa_check(:mainnet | :testnet, Work.compact()) ::
+          (map(), BlockHeader.t(), fun() -> :ok | {:error, atom()})
+  def default_daa_check(:testnet, _pow_limit_compact),
+    do: fn _parent_node, _header, _ancestor_fun -> {:error, :testnet_daa_unsupported} end
+
+  def default_daa_check(_mainnet, pow_limit_compact), do: daa_checker(pow_limit_compact)
+
   # Tree options. The PoW gate defaults to a **consensus pow-limit-aware** check
   # (`Work.valid_pow?/3` bound to `:pow_limit`, default mainnet/testnet
   # `0x1d00ffff`) so the production chain rejects easier-than-consensus headers; an
@@ -359,8 +373,19 @@ defmodule Athanor.P2P.HeadersChain do
     pow_limit = Keyword.get(opts, :pow_limit, @default_pow_limit)
     default_check = fn hash, bits -> Work.valid_pow?(hash, bits, pow_limit) end
 
+    # F7.1: default the cw-144 DAA gate, network-resolved **lazily** (only when no
+    # explicit `:daa_check` is given) so the network need not be resolved when the
+    # gate is overridden. Testnet is a fail-closed stub (§D3). An explicit
+    # `:daa_check`/`:pow_check` still wins.
+    daa_check =
+      Keyword.get_lazy(opts, :daa_check, fn ->
+        network = Keyword.get(opts, :network, Athanor.Blockchain.Network.network())
+        default_daa_check(network, pow_limit)
+      end)
+
     opts
     |> Keyword.take([:window])
     |> Keyword.put(:pow_check, Keyword.get(opts, :pow_check, default_check))
+    |> Keyword.put(:daa_check, daa_check)
   end
 end

@@ -115,6 +115,14 @@ defmodule Athanor.P2P.HeadersChainTest do
         do: merged,
         else: Keyword.put(merged, :pow_check, fn _h, _b -> true end)
 
+    # Bypass the F7.1 cw-144 DAA gate by default — these tests exercise the
+    # GenServer plumbing (getheaders/reorg/escalation) with synthetic headers that
+    # have no real difficulty window; the DAA gate is covered by its own tests.
+    merged =
+      if Keyword.has_key?(merged, :daa_check),
+        do: merged,
+        else: Keyword.put(merged, :daa_check, fn _p, _h, _a -> :ok end)
+
     start_supervised!({HeadersChain, merged}, id: {HeadersChain, make_ref()})
   end
 

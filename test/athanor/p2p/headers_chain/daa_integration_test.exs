@@ -164,4 +164,27 @@ defmodule Athanor.P2P.HeadersChain.DaaIntegrationTest do
       refute Map.has_key?(t1.nodes, BlockHeader.hash(cand))
     end
   end
+
+  describe "default_daa_check/2 (T7.1.7 network-resolved default, D3)" do
+    test "the mainnet default is the real cw-144 checker (:ok for correct bits, error otherwise)" do
+      %{tree: tree, top_hash: top} = seeded_tree()
+      checker = HeadersChain.default_daa_check(:mainnet, @pow_limit)
+      af = Tree.ancestor_fun(tree)
+      parent = tree.nodes[top]
+
+      assert checker.(parent, hdr(top, 1, @stable_bits), af) == :ok
+
+      assert match?(
+               {:error, :difficulty_mismatch},
+               checker.(parent, hdr(top, 1, @easier_bits), af)
+             )
+    end
+
+    test "the testnet default is a fail-closed stub — never a silent :ok" do
+      stub = HeadersChain.default_daa_check(:testnet, @pow_limit)
+
+      assert stub.(%{}, hdr(:binary.copy(<<0>>, 32), 1, @stable_bits), fn _n, _k -> nil end) ==
+               {:error, :testnet_daa_unsupported}
+    end
+  end
 end
