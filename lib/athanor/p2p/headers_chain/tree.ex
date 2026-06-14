@@ -49,15 +49,31 @@ defmodule Athanor.P2P.HeadersChain.Tree do
   alias Athanor.P2P.HeadersChain.Work
   alias Athanor.P2P.Messages.BlockHeader
 
-  defstruct nodes: %{}, tip: nil, root: nil, window: 144, seq: 0, pow_check: nil, daa_check: nil
+  # Retained-window depth (decision §D2). It must hold the full cw-144 DAA window
+  # (`P..P-146` = 147 blocks) for **every** block a reorg could re-validate: a reorg
+  # of depth `d` connects blocks down to `tip-d+1`, the deepest of which needs
+  # ancestry down to `tip-d-145`. With the reorg budget of 144 that is
+  # `147 + 144 = 291`. A smaller window would silently demote post-prune operation
+  # to the Phase-6 pow-only gate (the `daa_check` would underflow); 291 keeps the
+  # DAA window above the validation frontier so it never does.
+  @default_window 291
+
+  defstruct nodes: %{},
+            tip: nil,
+            root: nil,
+            window: @default_window,
+            seq: 0,
+            pow_check: nil,
+            daa_check: nil
 
   @type wire_hash :: <<_::256>>
   @type t :: %__MODULE__{}
 
   @doc """
   Builds a tree seeded with a synthetic root at `seed_hash` (wire order) /
-  `seed_height`. Options: `:window` (default 144), `:pow_check` (default
-  `&Work.meets_target?/2`).
+  `seed_height`. Options: `:window` (default #{@default_window} — the cw-144 DAA
+  window plus the reorg budget, §D2), `:pow_check` (default `&Work.meets_target?/2`),
+  `:daa_check` (default the `:ok` bypass).
   """
   @spec new(wire_hash(), non_neg_integer(), keyword()) :: t()
   def new(seed_hash, seed_height, opts \\ []) do
@@ -67,7 +83,7 @@ defmodule Athanor.P2P.HeadersChain.Tree do
       nodes: %{seed_hash => root},
       tip: seed_hash,
       root: seed_hash,
-      window: Keyword.get(opts, :window, 144),
+      window: Keyword.get(opts, :window, @default_window),
       seq: 1,
       pow_check: Keyword.get(opts, :pow_check, &Work.meets_target?/2),
       daa_check: Keyword.get(opts, :daa_check, &__MODULE__.ok_daa/3)

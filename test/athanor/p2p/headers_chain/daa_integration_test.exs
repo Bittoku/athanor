@@ -127,4 +127,41 @@ defmodule Athanor.P2P.HeadersChain.DaaIntegrationTest do
     assert_received {:daa_called, 800_000, nil}
     refute Map.has_key?(t1.nodes, BlockHeader.hash(cand))
   end
+
+  describe "retained window preserves the DAA window across prune (T7.1.6 / D2)" do
+    test "after prune the full P..P-146 window survives and a new header still validates" do
+      seed_hash = :binary.copy(<<0xDD>>, 32)
+      {window, {top, top_time}} = build_window(seed_hash, 1_500_000_000, 300, @stable_bits)
+
+      {seeded, _} =
+        Tree.new(seed_hash, 500_000, pow_check: always_ok()) |> Tree.step({:connect, window})
+
+      {pruned, _} = Tree.step(seeded, :prune)
+
+      # The DAA window survived the prune: P..P-146 are all real ancestors.
+      assert Tree.ancestor_fun(pruned).(pruned.nodes[top], 146) != nil
+
+      # ...and the next consensus-correct header connects through the real gate.
+      tree = %{pruned | daa_check: HeadersChain.daa_checker(@pow_limit)}
+      cand = hdr(top, top_time + 600, @stable_bits)
+      {t1, _} = Tree.step(tree, {:connect, [cand]})
+      assert Map.has_key?(t1.nodes, BlockHeader.hash(cand))
+    end
+
+    test "a too-small retained window underflows and fails closed (never pow-only)" do
+      seed_hash = :binary.copy(<<0xEE>>, 32)
+      {window, {top, top_time}} = build_window(seed_hash, 1_500_000_000, 160, @stable_bits)
+
+      {seeded, _} =
+        Tree.new(seed_hash, 500_000, window: 5, pow_check: always_ok())
+        |> Tree.step({:connect, window})
+
+      {pruned, _} = Tree.step(seeded, :prune)
+      tree = %{pruned | daa_check: HeadersChain.daa_checker(@pow_limit)}
+
+      cand = hdr(top, top_time + 600, @stable_bits)
+      {t1, _} = Tree.step(tree, {:connect, [cand]})
+      refute Map.has_key?(t1.nodes, BlockHeader.hash(cand))
+    end
+  end
 end
