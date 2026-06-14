@@ -268,6 +268,7 @@ defmodule Athanor.Indexer.TransactionProcessorStas3Test do
       satoshis = 4_242
 
       script = build_stas3_script(redemption: proto, owner: owner_pkh)
+
       tx = %BSV.Transaction{
         version: 1,
         lock_time: 0,

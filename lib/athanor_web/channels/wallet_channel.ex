@@ -179,15 +179,18 @@ defmodule AthanorWeb.WalletChannel do
         case Base.decode16(txid_hex, case: :mixed) do
           {:ok, txid_binary} ->
             case Repo.get_by(MetaTransaction, txid: txid_binary) do
-              nil -> %{txid: txid_hex, found: false}
-              meta -> %{
-                txid: txid_hex,
-                found: true,
-                hex: meta.hex,
-                block_height: meta.block_height,
-                is_confirmed: meta.is_confirmed,
-                timestamp: meta.timestamp
-              }
+              nil ->
+                %{txid: txid_hex, found: false}
+
+              meta ->
+                %{
+                  txid: txid_hex,
+                  found: true,
+                  hex: meta.hex,
+                  block_height: meta.block_height,
+                  is_confirmed: meta.is_confirmed,
+                  timestamp: meta.timestamp
+                }
             end
 
           :error ->
