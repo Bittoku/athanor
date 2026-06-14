@@ -228,4 +228,44 @@ defmodule Athanor.P2P.HeadersChain.DaaIntegrationTest do
       assert_raise MatchError, fn -> Tree.seed_window(tree, [orphan]) end
     end
   end
+
+  describe "ensure_seeded seed contract under the armed gate (T7.1.8 / D1, blocker 3)" do
+    # A real HeadersChain GenServer whose `:seed` returns `seed_result`. With no
+    # explicit `:daa_check` the production cw-144 gate is armed (the default mainnet
+    # checker), so a windowless seed must leave the chain inert rather than build a
+    # tree that rejects every header for an insufficient window.
+    defp start_chain(seed_result, extra \\ []) do
+      opts =
+        [
+          seed: fn -> seed_result end,
+          pow_check: always_ok(),
+          tick_interval_ms: 600_000,
+          registry: :"reg_#{System.unique_integer([:positive])}"
+        ] ++ extra
+
+      start_supervised!({HeadersChain, opts}, id: {HeadersChain, make_ref()})
+    end
+
+    test "an armed chain refuses a windowless 3-tuple seed and stays inert" do
+      pid = start_chain({:ok, 700_000, :binary.copy(<<0x31>>, 32)})
+      assert GenServer.call(pid, :root_height) == nil
+    end
+
+    test "an armed chain accepts a 4-tuple seed and plants the real window" do
+      seed_hash = :binary.copy(<<0x32>>, 32)
+      {window, _} = build_window(seed_hash, 1_600_000_000, 147, @stable_bits)
+      pid = start_chain({:ok, 600_000, seed_hash, window})
+
+      assert GenServer.call(pid, :root_height) == 600_000
+    end
+
+    test "an explicit :daa_check bypass still honours the legacy 3-tuple seed" do
+      pid =
+        start_chain({:ok, 700_000, :binary.copy(<<0x33>>, 32)},
+          daa_check: fn _p, _h, _a -> :ok end
+        )
+
+      assert GenServer.call(pid, :root_height) == 700_000
+    end
+  end
 end

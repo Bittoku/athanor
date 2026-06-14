@@ -111,13 +111,24 @@ defmodule Athanor.P2P.Supervisor do
 
   @doc """
   Builds a `PeerPool.Config` from application env (`config :athanor, Athanor.P2P`).
-  Reads `:network` (default `:testnet`) and `:target` (default 8); advertises a
-  default `Athanor` version.
+  Reads `:target` (default 8) and `:network`; advertises a default `Athanor` version.
+
+  The P2P network — and therefore the armed cw-144 DAA gate (mainnet checker vs the
+  testnet fail-closed stub) — defaults to the **authoritative application network**
+  (`Athanor.Blockchain.Network.resolve/0`, the pure config reader for
+  `config :athanor, :network`), so an operator setting `NETWORK=mainnet` reliably
+  arms mainnet validation without a second `Athanor.P2P` network key. An explicit
+  `config :athanor, Athanor.P2P, network:` override still wins (resolved lazily so it
+  is honoured without consulting the application network).
   """
   @spec runtime_pool_config() :: PeerPool.Config.t()
   def runtime_pool_config do
     env = Application.get_env(:athanor, @config_key, [])
-    network = Network.for_network(Keyword.get(env, :network, :testnet))
+
+    network =
+      Network.for_network(
+        Keyword.get_lazy(env, :network, fn -> Athanor.Blockchain.Network.resolve() end)
+      )
 
     %PeerPool.Config{
       network: network,

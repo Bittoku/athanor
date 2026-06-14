@@ -48,12 +48,18 @@ defmodule Athanor.P2P.HeadersChain.Daa do
 
   @doc """
   `GetSuitableBlock`: the median-by-`:time` of a 3-node triple, given in
-  `[b_minus2, b_minus1, b]` order, via the standard 3-element sorting network. This
-  de-noises a retarget endpoint against a single skewed timestamp.
+  **consensus `[B, B-1, B-2]` order** (anchor first), via the same 3-element
+  sorting network bitcoin-abc uses — slots `(0,2),(0,1),(1,2)`, swapping only on a
+  strict `>`, returning slot 1. This de-noises a retarget endpoint against a single
+  skewed timestamp. The input order is consensus-relevant for **equal timestamps**:
+  the stable, swap-on-`>`-only network returns a different element of an equal-time
+  triple depending on input order, and that element's `:cum_work` feeds the
+  retarget — so the triple must be `[B, B-1, B-2]`, not the reverse.
   """
   @spec suitable([daa_node()]) :: daa_node()
   def suitable([b0, b1, b2]) do
-    # 3-element sorting network by :time; the median lands in slot 1.
+    # 3-element sorting network by :time; the median lands in slot 1. Mirrors
+    # bitcoin-abc GetSuitableBlock on the ordered triple {B, B-1, B-2}.
     {b0, b2} = swap_by_time(b0, b2)
     {b0, b1} = swap_by_time(b0, b1)
     {b1, _b2} = swap_by_time(b1, b2)
@@ -104,13 +110,15 @@ defmodule Athanor.P2P.HeadersChain.Daa do
     end
   end
 
-  # The triple `[anchor-2, anchor-1, anchor]` where anchor = P-`offset`, or `nil`
-  # if any of the three ancestors is outside the retained real-header window.
+  # The triple `[anchor, anchor-1, anchor-2]` (consensus `{B, B-1, B-2}` order)
+  # where anchor = P-`offset`, or `nil` if any of the three ancestors is outside the
+  # retained real-header window. The anchor-first order is required so `suitable/1`
+  # reproduces bitcoin-abc `GetSuitableBlock` tie semantics for equal timestamps.
   defp window(parent_node, ancestor_fun, offset) do
-    with a when not is_nil(a) <- ancestor_fun.(parent_node, offset + 2),
-         b when not is_nil(b) <- ancestor_fun.(parent_node, offset + 1),
-         c when not is_nil(c) <- ancestor_fun.(parent_node, offset) do
-      [a, b, c]
+    with anchor when not is_nil(anchor) <- ancestor_fun.(parent_node, offset),
+         anchor_1 when not is_nil(anchor_1) <- ancestor_fun.(parent_node, offset + 1),
+         anchor_2 when not is_nil(anchor_2) <- ancestor_fun.(parent_node, offset + 2) do
+      [anchor, anchor_1, anchor_2]
     else
       _ -> nil
     end

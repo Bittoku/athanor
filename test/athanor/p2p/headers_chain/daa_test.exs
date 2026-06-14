@@ -38,6 +38,18 @@ defmodule Athanor.P2P.HeadersChain.DaaTest do
              ]).time ==
                500
     end
+
+    test "an equal-timestamp tie selects the consensus {B,B-1,B-2} element (blocker 1)" do
+      # B and B-2 share a timestamp; B-1 is earlier; B vs B-2 have distinct cum_work.
+      # bitcoin-abc feeds [B, B-1, B-2] and its swap-on-`>`-only network returns B.
+      b = %{time: 2000, cum_work: 9_000}
+      b1 = %{time: 1000, cum_work: 8_500}
+      b2 = %{time: 2000, cum_work: 8_000}
+
+      assert Daa.suitable([b, b1, b2]) == b
+      # The reversed input order (the pre-fix bug) would have returned B-2 instead.
+      assert Daa.suitable([b2, b1, b]) == b2
+    end
   end
 
   describe "expected_bits/3 window handling" do
@@ -46,6 +58,34 @@ defmodule Athanor.P2P.HeadersChain.DaaTest do
       # ancestor_fun that only knows the parent itself.
       anc = fn _node, n -> if n == 0, do: parent, else: nil end
       assert Daa.expected_bits(parent, anc, @pow_limit) == {:error, :insufficient_window}
+    end
+
+    test "the `last` endpoint window is read in consensus {P,P-1,P-2} order (blocker 1)" do
+      # The `last` triple {P, P-1, P-2} ties P and P-2 on time (P-1 earlier), with
+      # cum_work large and DISTINCT so the retarget is below the pow-limit (unclamped)
+      # and the chosen endpoint is observable in `expected_bits`. Consensus selects P;
+      # the pre-fix reversed window order would have selected P-2.
+      p = %{time: 1_000_000, cum_work: 4_000_000_000_000}
+      p1 = %{time: 900_000, cum_work: 3_500_000_000_000}
+      p2 = %{time: 1_000_000, cum_work: 3_000_000_000_000}
+
+      # The `first` triple {P-144, P-145, P-146} is strictly ordered (unambiguous);
+      # its median (P-145) anchors the retarget.
+      f0 = %{time: 899_000, cum_work: 0}
+      f1 = %{time: 898_000, cum_work: 0}
+      f2 = %{time: 897_000, cum_work: 0}
+
+      nodes = %{0 => p, 1 => p1, 2 => p2, 144 => f0, 145 => f1, 146 => f2}
+      anc = fn _node, n -> Map.get(nodes, n) end
+
+      {:ok, pow_target} = Work.compact_to_target(@pow_limit)
+      first = Daa.suitable([f0, f1, f2])
+      consensus = Daa.compute_target(first, p, pow_target)
+      reversed = Daa.compute_target(first, p2, pow_target)
+
+      # The bug is only observable if the two endpoints give different bits.
+      refute consensus == reversed
+      assert Daa.expected_bits(p, anc, @pow_limit) == {:ok, consensus}
     end
   end
 

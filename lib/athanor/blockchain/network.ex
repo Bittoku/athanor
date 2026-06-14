@@ -14,6 +14,22 @@ defmodule Athanor.Blockchain.Network do
     GenServer.call(__MODULE__, :network)
   end
 
+  @doc """
+  Resolves the configured network (`:mainnet | :testnet`) **purely** from
+  `config :athanor, :network` (default `"mainnet"`), without consulting the
+  GenServer. This is the single source of truth `init/1` caches; callers that run
+  before/without the process (e.g. the P2P supervisor building its pool config) use
+  it directly so they cannot diverge from the authoritative network.
+  """
+  @spec resolve() :: :mainnet | :testnet
+  def resolve do
+    case Application.get_env(:athanor, :network, "mainnet") do
+      "testnet" -> :testnet
+      "stn" -> :testnet
+      _ -> :mainnet
+    end
+  end
+
   @doc "Returns true if running on mainnet."
   def is_mainnet? do
     network() == :mainnet
@@ -33,14 +49,7 @@ defmodule Athanor.Blockchain.Network do
 
   @impl true
   def init(_opts) do
-    network =
-      case Application.get_env(:athanor, :network, "mainnet") do
-        "testnet" -> :testnet
-        "stn" -> :testnet
-        _ -> :mainnet
-      end
-
-    {:ok, %{network: network}}
+    {:ok, %{network: resolve()}}
   end
 
   @impl true

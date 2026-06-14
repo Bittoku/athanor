@@ -88,6 +88,12 @@ defmodule Athanor.P2P.HeadersChain do
       cooldown_ms: Keyword.get(opts, :cooldown_ms, 1_000),
       max_detached_rounds: Keyword.get(opts, :max_detached_rounds, 3),
       tree_opts: build_tree_opts(opts),
+      # The cw-144 DAA gate is "armed" whenever `:daa_check` is **defaulted** (the
+      # production mainnet checker or the testnet fail-closed stub) — both reject a
+      # header lacking a full window. A caller that passes an explicit `:daa_check`
+      # (e.g. a fixture/legacy bypass) takes responsibility and is not armed. Used
+      # to refuse the windowless 3-tuple seed under an armed gate (§D1, fail closed).
+      daa_armed?: not Keyword.has_key?(opts, :daa_check),
       detached_rounds: 0,
       detached_peer: nil,
       last_getheaders: %{},
@@ -277,8 +283,15 @@ defmodule Athanor.P2P.HeadersChain do
           :error -> state
         end
 
+      # Legacy/fixture 3-tuple seed: a single synthetic root with **no** DAA window.
+      # Under the armed gate this would look seeded but reject every header for an
+      # insufficient window (never advancing) — so refuse it and stay inert/retry
+      # (§D1, fail closed). It is only honoured when the caller opted out of the gate
+      # with an explicit `:daa_check` bypass (fixtures/legacy).
       {:ok, height, hash} ->
-        %{state | tree: Tree.new(hash, height, state.tree_opts)}
+        if state.daa_armed?,
+          do: state,
+          else: %{state | tree: Tree.new(hash, height, state.tree_opts)}
 
       _ ->
         state
