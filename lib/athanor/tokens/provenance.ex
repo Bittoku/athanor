@@ -2,6 +2,11 @@ defmodule Athanor.Tokens.Provenance do
   @moduledoc """
   Token lineage verification — confirms a STAS token traces back to a
   valid genesis issuance via the B2G resolver and local DB records.
+
+  This is the indexer-trust (non-cryptographic) provenance model: a naive
+  full back-trace walk over the input chain, NOT a trust-minimized proof.
+  Correctness relies on the discoverable, open-sourced indexer set, not on
+  any on-chain or cryptographic provenance guarantee.
   """
 
   alias Athanor.Repo
